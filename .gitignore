@@ -1,0 +1,19 @@
+.venv*/
+__pycache__/
+.pytest_cache/
+.pytest-tmp/
+*.py[cod]
+results/
+data/workloads/
+.coverage
+htmlcov/
+
+# 文献管理文件
+docs/
+*.egg-info/
+.claude/
+
+# 本地协作、毕设过程与文献管理文件（不纳入公开仓库）
+AGENTS.md
+inspect_zotero.py
+.agents/

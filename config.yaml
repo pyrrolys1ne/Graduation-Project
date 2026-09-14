@@ -1,0 +1,20 @@
+model:
+  name: openai/clip-vit-base-patch32
+  device: cuda
+  dtype: float16
+  local_files_only: true
+scheduler:
+  policy: edf_size
+  deadline_tie_ms: 5.0
+  quota_levels: [0.25, 0.5, 0.75, 1.0]
+executor:
+  streams: 2
+  resource_backend: proxy
+  allow_proxy_fallback: true
+  libsmctrl_adapter: ""
+profiling:
+  table_path: data/profiles/default.csv
+logging:
+  output_dir: results
+  request_log: requests.jsonl
+seed: 20260902

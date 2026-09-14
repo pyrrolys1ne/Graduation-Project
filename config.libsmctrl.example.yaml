@@ -1,0 +1,23 @@
+model:
+  name: openai/clip-vit-base-patch32
+  device: cuda
+  dtype: float16
+  local_files_only: true
+scheduler:
+  policy: edf_size
+  deadline_tie_ms: 5.0
+  quota_levels: [0.25, 0.5, 0.75, 1.0]
+executor:
+  streams: 2
+  resource_backend: libsmctrl
+  # 项目自带的真实适配器；它按 ctypes 调用上游 libsmctrl.so。
+  # 需要先构建库: scripts/build_libsmctrl.sh，并设置 LIBSMCTRL_PATH。
+  libsmctrl_adapter: "encoder_sched.libsmctrl_adapter:apply_quota"
+  # 正式实验禁止把真实控制失败静默降级为 proxy
+  allow_proxy_fallback: false
+profiling:
+  table_path: data/profiles/default.csv
+logging:
+  output_dir: results
+  request_log: requests.jsonl
+seed: 20260902
