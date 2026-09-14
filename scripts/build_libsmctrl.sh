@@ -13,13 +13,15 @@ UPSTREAM_URL="${LIBSMCTRL_UPSTREAM:-http://rtsrv.cs.unc.edu/cgit/cgit.cgi/libsmc
 SRC_DIR="${LIBSMCTRL_SRC:-$HOME/.cache/libsmctrl}"
 PREFIX="${LIBSMCTRL_PREFIX:-$HOME/.local/lib/libsmctrl}"
 CHECK_ONLY=0
+APPLY_PATCH=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --prefix) PREFIX="$2"; shift 2 ;;
     --src) SRC_DIR="$2"; shift 2 ;;
     --check-only) CHECK_ONLY=1; shift ;;
-    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+    --no-patch) APPLY_PATCH=0; shift ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
 done
@@ -61,10 +63,26 @@ if [[ -d "$SRC_DIR/.git" ]]; then
   git -C "$SRC_DIR" pull --quiet --ff-only || echo "  警告: 拉取失败，使用本地版本"
 else
   rm -rf "$SRC_DIR"
-  git clone --quiet --depth 1 "$UPSTREAM_URL" "$SRC_DIR" \
+  # 不加 --depth 1：上游的 cgit 走 dumb http transport，不支持浅克隆。
+  git clone --quiet "$UPSTREAM_URL" "$SRC_DIR" \
     || fail "克隆失败: $UPSTREAM_URL （网络受限时可手动克隆后用 --src 指定）"
 fi
 echo "  提交: $(git -C "$SRC_DIR" rev-parse --short HEAD)"
+
+PATCH_FILE="${LIBSMCTRL_PATCH:-$(cd "$(dirname "$0")/.." && pwd)/patches/libsmctrl-thread-mask.patch}"
+if [[ "$APPLY_PATCH" == "1" && -f "$PATCH_FILE" ]]; then
+  echo "== 应用补丁 =="
+  echo "  $PATCH_FILE"
+  if grep -q "libsmctrl_set_thread_mask" "$SRC_DIR/libsmctrl.c"; then
+    echo "  已是打过补丁的状态，跳过"
+  else
+    patch -d "$SRC_DIR" -p1 --forward < "$PATCH_FILE" \
+      || fail "补丁应用失败；上游可能已变动，请人工核对 $PATCH_FILE"
+    echo "  已应用（新增 libsmctrl_set_thread_mask：粘性线程掩码）"
+  fi
+elif [[ "$APPLY_PATCH" != "1" ]]; then
+  echo "== 跳过补丁（--no-patch）=="
+fi
 
 echo "== 构建 libsmctrl.so =="
 make -C "$SRC_DIR" libsmctrl.so CUDA="$CUDA_HOME"

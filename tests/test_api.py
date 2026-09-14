@@ -15,7 +15,6 @@ def write_config(tmp_path: Path) -> Path:
         f"""
 model:
   name: openai/clip-vit-base-patch32
-  device: cpu
   dtype: float32
 scheduler:
   policy: edf_size
@@ -93,14 +92,35 @@ def test_libsmctrl_with_fake_encoder_is_rejected_at_startup(tmp_path):
             pass
 
 
-def test_libsmctrl_with_cpu_device_is_rejected_at_startup(tmp_path):
-    config = _make_libsmctrl_config(tmp_path)
-    text = config.read_text(encoding="utf-8").replace("device: cpu", "device: cpu")
+def test_config_with_removed_device_field_gives_migration_hint(tmp_path):
+    """`model.device` 已移除。旧配置必须得到明确提示，而不是难懂的 TypeError。
+
+    真实 CLIP 后端只支持 CUDA；曾支持的 `device: cpu` 分支从未被真正执行过
+    （测试夹具写过它，但所有调用都走 fake=True）。
+    """
+    config = write_config(tmp_path)
+    text = config.read_text(encoding="utf-8").replace(
+        "  name: openai/clip-vit-base-patch32\n", "  name: openai/clip-vit-base-patch32\n  device: cpu\n"
+    )
     config.write_text(text, encoding="utf-8")
-    app = create_app(config, fake=False)
-    with pytest.raises(ValueError, match="model.device=cuda|CPU 没有 CUDA stream"):
+    app = create_app(config, fake=True)
+    with pytest.raises(ValueError, match="model.device 已移除"):
         with TestClient(app):
             pass
+
+
+def test_model_config_has_no_device_field():
+    """CPU 推理路径已删除：`ModelConfig` 不应再有 `device` 字段。
+
+    这条是契约检查而非源码扫描——扫描源码会把 docstring 里解释性的字样也当成
+    "残留分支"，测试会碎得毫无价值。
+    """
+    from dataclasses import fields
+
+    from encoder_sched.config import ModelConfig
+
+    names = {item.name for item in fields(ModelConfig)}
+    assert "device" not in names, f"ModelConfig 仍暴露 device 字段: {sorted(names)}"
 
 
 def test_health_reports_resource_capability(tmp_path):

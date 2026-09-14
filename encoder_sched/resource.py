@@ -23,6 +23,14 @@ class ResourceBackend(ABC):
     def apply_quota(self, stream_or_worker: Any, sm_fraction: float) -> dict[str, Any]:
         raise NotImplementedError
 
+    def release_quota(self, stream_or_worker: Any) -> None:
+        """请求结束时释放该执行主体占用的资源。
+
+        默认不做任何事。真实 TPC 掩码后端必须实现它：分配在下一次 ``apply_quota``
+        之前会一直被占用，若不释放，空闲线程持有的旧分配会挡住后续请求。
+        """
+        return None
+
     def describe(self) -> dict[str, Any]:
         return {
             "configured_backend": self.name,
@@ -64,9 +72,10 @@ class ProxyResourceBackend(ResourceBackend):
 
 class LibSmCtrlBackend(ResourceBackend):
     name = "libsmctrl"
-    #: 只有在能力探针确认驱动版本受支持且 TPC 可查询后，实例才会把它置为 True。
-    #: 绝不能是类级常量：libsmctrl_set_stream_mask 返回 void，版本不匹配时它只向
-    #: stderr 打印一行就返回，调用方无法察觉，把这种情况记为"已隔离"就是伪造结果。
+    #: 只有在能力探针确认「补丁库到位 + TPC 可查询 + 回调注册成功」后，实例才会把
+    #: 它置为 True。绝不能是类级常量：掩码下发函数返回 void，调用方无法从返回值
+    #: 察觉失败；而回调注册失败会直接 `exit(1)` 终止进程。把"调用没报错"记为
+    #: "已隔离"就是伪造结果。
     enforces_sm_partition = False
 
     def __init__(self, adapter: str):
@@ -86,6 +95,8 @@ class LibSmCtrlBackend(ResourceBackend):
             raise UnsupportedResourceBackend(f"libsmctrl 适配器 {adapter} 不可调用")
         self.adapter = adapter
         self._last_apply: dict[str, Any] | None = None
+        self._module = module
+        self._release: Callable[[], Any] | None = getattr(module, "release", None)
         self.capability: dict[str, Any] = self._run_probe(module)
 
     def _run_probe(self, module: Any) -> dict[str, Any]:
@@ -122,6 +133,11 @@ class LibSmCtrlBackend(ResourceBackend):
         )
         self._last_apply = result
         return result
+
+    def release_quota(self, stream_or_worker: Any) -> None:
+        """释放当前线程占用的 TPC 分配（回调路径的掩码是线程局部的）。"""
+        if callable(self._release):
+            self._release()
 
     def describe(self) -> dict[str, Any]:
         result = super().describe()

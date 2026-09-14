@@ -43,11 +43,25 @@ class EncoderService:
         self._jobs_lock = threading.Lock()
         self._counter = itertools.count()
         self._workers: list[asyncio.Task[None]] = []
-        self.gpu_sampler = GpuUtilizationSampler(metrics)
+        self.gpu_sampler = GpuUtilizationSampler(metrics, interval_s=config.metrics.gpu_sample_interval_s)
 
     async def start(self) -> None:
-        worker_count = 1 if self.scheduler.policy in {"serial_fcfs", "dacc"} else self.config.executor.streams
-        self._workers = [asyncio.create_task(self._worker(index), name=f"encoder-worker-{index}") for index in range(worker_count)]
+        batching = self.config.batching.max_batch > 1
+        if batching and self.scheduler.policy == "dacc":
+            raise ValueError(
+                "批处理与 dacc 策略不能同时启用：dacc 自己就要在同一窗口内挑选 2 个请求并发执行，"
+                "再叠加批处理会让'一次前向处理几个请求'这件事被两套逻辑同时决定。"
+            )
+        if batching:
+            # 批处理模式下由单个 worker 组批，并发度来自 batch 而不是多 worker
+            worker_count = 1
+            coro = self._batch_worker
+        else:
+            worker_count = 1 if self.scheduler.policy in {"serial_fcfs", "dacc"} else self.config.executor.streams
+            coro = self._worker
+        self._workers = [
+            asyncio.create_task(coro(index), name=f"encoder-worker-{index}") for index in range(worker_count)
+        ]
         self.gpu_sampler.start()
 
     async def stop(self) -> None:
@@ -99,6 +113,96 @@ class EncoderService:
                 job.error = f"{type(exc).__name__}: {exc}"
             finally:
                 job.finished_ns = time.perf_counter_ns()
+                self.metrics.record(job)
+                future = self.futures.get(job.request_id)
+                if future is not None and not future.done():
+                    future.set_result(job)
+                self.queue.task_done()
+
+    async def _batch_worker(self, worker_id: int) -> None:
+        """批处理 worker：从队列收集**同尺寸**请求凑成一批，一次前向完成。
+
+        与空间分割的区别是本课题的核心对照：批处理把多个请求合并成一次前向，让硬件
+        自己在同一批 SM 上交错调度各请求的 block（吞吐高，但请求要等组批）；空间分割
+        给每个请求独立的 TPC 区间（无需等待，但划分后 SM 内部不再有跨请求填空的机会）。
+
+        "愿意等多久"由 ``batching.max_delay_ms`` 直接控制——这正是取舍的核心旋钮：
+        设为 0 表示绝不等待、只取队列里已有的请求，那时它与逐请求执行几乎没有区别。
+        """
+        max_batch = self.config.batching.max_batch
+        delay_s = self.config.batching.max_delay_ms / 1000.0
+        # 扫描窗口。批处理要求张量同形状，而请求的尺寸在队列里是交错的
+        # （例如 224/336/448/672 循环到达），只看队首的下一个必然凑不成批——
+        # 实测中曾因此让所有批大小都是 1，整轮实验等于在测空气。
+        # 取 max_batch × 4 是为了让每种尺寸至少出现 max_batch 次。
+        scan = max(max_batch * 4, 8)
+        while True:
+            _, _, first = await self.queue.get()
+            held = [first]
+            # 先把队列里**已经存在**的请求全部取出（不等新到达）。
+            # 少了这一步，delay_ms=0 会退化成纯串行——实测中 batch4_d0 的平均批大小
+            # 因此恒为 1.00，与 serial_fcfs 毫无区别。
+            while len(held) < scan:
+                try:
+                    _, _, candidate = self.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                held.append(candidate)
+            # 再按 delay_ms 等待新到达，直到凑够扫描窗口或超时。
+            deadline = time.perf_counter() + delay_s
+            while len(held) < scan:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    _, _, candidate = await asyncio.wait_for(self.queue.get(), remaining)
+                except asyncio.TimeoutError:
+                    break
+                held.append(candidate)
+
+            # 按尺寸分组，取最大的一组凑成这一批；其余原样放回队列。
+            groups: dict[tuple[int, int], list[EncodeJob]] = {}
+            for job in held:
+                groups.setdefault((job.width, job.height), []).append(job)
+            _, jobs = max(groups.items(), key=lambda item: len(item[1]))
+            jobs = jobs[:max_batch]
+            chosen = {id(job) for job in jobs}
+            for job in held:
+                if id(job) not in chosen:
+                    await self.queue.put((self.scheduler.rank_key(job), next(self._counter), job))
+                    self.queue.task_done()
+            await self._run_batch(jobs, worker_id)
+
+    async def _run_batch(self, jobs: list[EncodeJob], worker_id: int) -> None:
+        for job in jobs:
+            job.state = JobState.RUNNING
+            job.started_ns = time.perf_counter_ns()
+        results = None
+        error: str | None = None
+        try:
+            results = await asyncio.to_thread(self.encoder.encode_batch, jobs, worker_id)
+        except Exception as exc:  # noqa: BLE001 - 记录到 job 上供 API 返回
+            error = f"{type(exc).__name__}: {exc}"
+        finished_ns = time.perf_counter_ns()
+        for index, job in enumerate(jobs):
+            try:
+                if results is None:
+                    job.state = JobState.FAILED
+                    job.error = error
+                else:
+                    result = results[index]
+                    job.embedding_dim = result.embedding_dim
+                    job.embedding_norm = result.embedding_norm
+                    job.execution_ms = result.execution_ms
+                    job.metadata["resource"] = result.resource
+                    job.metadata["batch_size"] = len(jobs)
+                    job.metadata["batch_index"] = index
+                    job.state = JobState.COMPLETED
+            except Exception as exc:  # noqa: BLE001
+                job.state = JobState.FAILED
+                job.error = f"{type(exc).__name__}: {exc}"
+            finally:
+                job.finished_ns = finished_ns
                 self.metrics.record(job)
                 future = self.futures.get(job.request_id)
                 if future is not None and not future.done():

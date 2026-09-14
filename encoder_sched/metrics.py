@@ -106,9 +106,14 @@ class MetricsStore:
 
 
 class GpuUtilizationSampler:
-    def __init__(self, metrics: MetricsStore, interval_s: float = 0.5):
+    #: 连续失败多少次后放弃采样。此前实现遇到第一次异常就直接 `return`，
+    #: 一次 nvidia-smi 抖动就会永久停止采样，且失败是静默的。
+    MAX_CONSECUTIVE_FAILURES = 5
+
+    def __init__(self, metrics: MetricsStore, interval_s: float = 0.1):
         self.metrics = metrics
         self.interval_s = interval_s
+        self.failures = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -134,5 +139,8 @@ class GpuUtilizationSampler:
                 )
                 first = completed.stdout.strip().splitlines()[0]
                 self.metrics.record_gpu_utilization(float(first))
+                self.failures = 0
             except (OSError, subprocess.SubprocessError, ValueError, IndexError):
-                return
+                self.failures += 1
+                if self.failures >= self.MAX_CONSECUTIVE_FAILURES:
+                    return

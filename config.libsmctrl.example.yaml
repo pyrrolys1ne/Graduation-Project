@@ -1,6 +1,5 @@
 model:
   name: openai/clip-vit-base-patch32
-  device: cuda
   dtype: float16
   local_files_only: true
 scheduler:

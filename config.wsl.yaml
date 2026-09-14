@@ -1,6 +1,5 @@
 model:
   name: openai/clip-vit-base-patch32
-  device: cuda
   dtype: float16
   local_files_only: true
 scheduler:
@@ -18,3 +17,7 @@ logging:
   output_dir: results
   request_log: requests.jsonl
 seed: 20260902
+
+metrics:
+  # nvidia-smi 返回瞬时快照；0.1s 采样可在秒级实验中取得足够样本
+  gpu_sample_interval_s: 0.1

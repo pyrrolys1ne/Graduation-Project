@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -56,12 +57,14 @@ class EncodeResponse(BaseModel):
 
 
 def _ensure_libsmctrl_target(config: AppConfig, fake: bool) -> None:
-    """libsmctrl 只能作用于真实 CUDA stream，启动阶段就拒绝错误组合。
+    """libsmctrl 只能作用于真实 CUDA 执行路径，启动阶段就拒绝错误组合。
 
-    ``libsmctrl_set_stream_mask`` 会把传入句柄当作 ``CUstream*`` **解引用**后按
-    偏移改写驱动内部结构。FakeEncoder 和 CPU 路径传的是 worker id，把它当成
-    stream 传入等于向任意地址写入。这里选择直接报错而不是自动改成 proxy，
-    因为静默降级会让配置错误一直隐藏到实验结果里。
+    FakeEncoder 传的是 worker id，不是 CUDA stream 句柄。掩码路径会把句柄当作
+    指针处理，传入无效值等于向任意地址写入。这里选择直接报错而不是自动改成
+    proxy，因为静默降级会让配置错误一直隐藏到实验结果里。
+
+    注：曾还需检查 ``model.device != "cuda"``，但 CPU 分支已删除（真实 CLIP 后端
+    只支持 CUDA），因此该组合在配置加载阶段就不可能成立。
     """
     if config.executor.resource_backend != "libsmctrl":
         return
@@ -70,21 +73,24 @@ def _ensure_libsmctrl_target(config: AppConfig, fake: bool) -> None:
             "resource_backend=libsmctrl 不能与 FakeEncoder 同用：FakeEncoder 传的是 worker id，"
             "不是 CUDA stream 句柄。如需验证软件链路，请显式改用 resource_backend=proxy。"
         )
-    if config.model.device != "cuda":
-        raise ValueError(
-            f"resource_backend=libsmctrl 要求 model.device=cuda，当前为 {config.model.device!r}；"
-            "CPU 没有 CUDA stream，无法承载 TPC 掩码。"
-        )
 
 
 def build_service(config: AppConfig, fake: bool = False) -> EncoderService:
     performance = PerformanceModel(config.resolve(config.profiling.table_path))
+    dacc_config = DaccConfig(
+        window=config.scheduler.dacc_window,
+        beta=config.scheduler.dacc_beta,
+        guard_ms=config.scheduler.dacc_guard_ms,
+    )
+    if config.scheduler.dacc_overrides:
+        dacc_config = replace(dacc_config, **config.scheduler.dacc_overrides)
     scheduler = Scheduler(
         config.scheduler.policy,
         performance,
         config.scheduler.quota_levels,
         config.scheduler.deadline_tie_ms,
-        DaccConfig(window=config.scheduler.dacc_window, beta=config.scheduler.dacc_beta, guard_ms=config.scheduler.dacc_guard_ms),
+        dacc_config,
+        quota_policy=config.scheduler.quota_policy,
     )
     _ensure_libsmctrl_target(config, fake)
     resource = create_resource_backend(
@@ -156,7 +162,13 @@ app = create_app()
 
 
 def main() -> None:
-    uvicorn.run("encoder_sched.api:app", host="127.0.0.1", port=8000, reload=False)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="启动编码器调度服务")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args()
+    uvicorn.run("encoder_sched.api:app", host=args.host, port=args.port, reload=False)
 
 
 if __name__ == "__main__":

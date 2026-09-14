@@ -1,7 +1,7 @@
 """libsmctrl 真实能力探针。
 
-只做无副作用的检查：加载库、读驱动版本、查 TPC 数量、判断 stream 掩码能否
-生效。默认**不会**下发任何掩码，也不会创建 CUDA context 之外的 GPU 负载。
+检查库是否打了补丁、TPC 是否可查、**回调能否安全注册**（在子进程中试调，因为回调
+注册失败会 `exit(1)`）。默认不会创建 GPU 负载。
 
 退出码：0 表示具备真实掩码能力；1 表示不具备（原因写入输出）。
 """
@@ -17,7 +17,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from encoder_sched.libsmctrl_adapter import (  # noqa: E402
-    SUPPORTED_DRIVER_VERSIONS,
     LibSmCtrlAdapter,
     enabled_tpcs_to_native_mask,
     fraction_to_enabled_tpcs,
@@ -36,8 +35,11 @@ def main() -> int:
         "platform": platform.platform(),
         "system": platform.system(),
         "adapter": "encoder_sched.libsmctrl_adapter",
-        "supported_driver_versions": sorted(SUPPORTED_DRIVER_VERSIONS),
+        "mask_path": "callback",
+        "note": "走启动回调路径 + 粘性线程掩码；不用 set_stream_mask（未知驱动版本会 exit(1)）",
     }
+    if args.library:
+        report["library"] = args.library
     adapter = LibSmCtrlAdapter(cuda_device=args.cuda_device, library_path=args.library)
     probe = adapter.probe()
     report["probe"] = probe
@@ -57,7 +59,8 @@ def main() -> int:
     available = bool(probe.get("available"))
     report["real_sm_masking_available"] = available
     report["conclusion"] = (
-        "具备真实 TPC 掩码下发能力；仍需独立测量确认掩码确实影响执行"
+        "具备真实 TPC 掩码能力；机制层面的证据见 demos/libsmctrl_thread_mask_demo.py，"
+        "效果层面的结论仍需 scripts/experiment_sm_quota.py 的独立测量"
         if available
         else "不具备真实掩码能力；【禁止】把该环境下的调度结果表述为 SM 隔离效果"
     )

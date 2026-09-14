@@ -1,0 +1,55 @@
+--- a/libsmctrl.c	2026-09-14 18:16:42.038530856 +0800
++++ libsmctrl.c	2026-09-14 18:16:42.054571310 +0800
+@@ -56,6 +56,10 @@
+ static uint64_t g_sm_mask = 0;
+ // Next mask (applies per-thread)
+ static __thread uint64_t g_next_sm_mask = 0;
++// Sticky per-thread mask: applies to *every* launch from this thread until
++// changed. Upstream's "next mask" covers only a single launch, which cannot
++// express per-request masking for a multi-kernel forward pass.
++static __thread uint64_t g_thread_sm_mask = 0;
+ // Flag value to indicate if setup has been completed
+ static bool sm_control_setup_called = false;
+ 
+@@ -99,8 +103,11 @@
+ 		abort(1, 0, "TMD version %04o is too old! This GPU does not support SM masking.\n", tmd_ver);
+ 	}
+ 
+-	// Setting the next mask overrides both per-stream and global masks
+-	if (g_next_sm_mask) {
++	// Sticky thread mask wins over everything else and is never cleared.
++	if (g_thread_sm_mask) {
++		*lower_ptr = (uint32_t)g_thread_sm_mask;
++		*upper_ptr = (uint32_t)(g_thread_sm_mask >> 32);
++	} else if (g_next_sm_mask) {
+ 		*lower_ptr = (uint32_t)g_next_sm_mask;
+ 		*upper_ptr = (uint32_t)(g_next_sm_mask >> 32);
+ 		g_next_sm_mask = 0;
+@@ -162,6 +169,13 @@
+ 	g_next_sm_mask = mask;
+ }
+ 
++// Sticky per-thread mask. Set from the thread that will launch the kernels;
++// only that thread is affected. Pass 0 to clear.
++void libsmctrl_set_thread_mask(uint64_t mask) {
++	setup_sm_control_callback();
++	g_thread_sm_mask = mask;
++}
++
+ 
+ /*** Per-Stream SM Mask (unlikely to be forward-compatible) ***/
+ 
+--- a/libsmctrl.h	2026-09-14 18:16:42.039455384 +0800
++++ libsmctrl.h	2026-09-14 18:16:42.054604660 +0800
+@@ -29,6 +29,11 @@
+ // @param mask   A bitmask of enabled/disabled TPCs (see Notes on Bitmasks)
+ // Supported: CUDA 6.5 - CUDA 12.6
+ extern void libsmctrl_set_next_mask(uint64_t mask);
++// Set a sticky TPC mask for all subsequent launches issued from the calling
++// CPU thread. Unlike libsmctrl_set_next_mask(), this persists across launches
++// until changed or cleared with 0, so it can express per-request masking for
++// workloads that span many kernel launches.
++extern void libsmctrl_set_thread_mask(uint64_t mask);
+ 
+ /**
+  * Notes on Bitmasks

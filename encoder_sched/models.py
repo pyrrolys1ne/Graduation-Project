@@ -35,6 +35,8 @@ class EncodeJob:
 
     @property
     def patches(self) -> int:
+        # CLIP ViT-B/32 的 patch 是 32×32；data/profiles/*.csv 也按此计算
+        # （224×224 记作 49 = (224/32)²）。改成 16 会让性能模型查到完全错误的桶。
         return (self.width // 32) * (self.height // 32)
 
     @property
