@@ -15,5 +15,6 @@ docs/
 
 # 本地协作、毕设过程与文献管理文件（不纳入公开仓库）
 AGENTS.md
+任务书.txt
 inspect_zotero.py
 .agents/
