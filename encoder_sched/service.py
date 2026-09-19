@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .concurrency import ConcurrencyConfig, ConcurrencyController
 from .config import AppConfig
 from .encoder import EncoderBackend
 from .metrics import GpuUtilizationSampler, MetricsStore
@@ -44,6 +45,14 @@ class EncoderService:
         self._counter = itertools.count()
         self._workers: list[asyncio.Task[None]] = []
         self.gpu_sampler = GpuUtilizationSampler(metrics, interval_s=config.metrics.gpu_sample_interval_s)
+        #: 运行时并发控制器。仅在 ``executor.adaptive_concurrency`` 打开时非 None，
+        #: 否则并发度仍是启动时定死的 ``executor.streams``（历史行为，保持可复现）。
+        self.controller: ConcurrencyController | None = None
+        # 已提交但尚未通过准入闸门的请求。worker 会先从 PriorityQueue 取走任务再等待
+        # 准入，因此只看 queue 无法得到真实等待集合；必须在服务层单独建账。
+        self._awaiting_admission: dict[str, int] = {}
+        # 只有整个执行区间始终没有共驻者的请求，才可与单请求剖析表比较。
+        self._drift_solo_candidates: set[str] = set()
 
     async def start(self) -> None:
         batching = self.config.batching.max_batch > 1
@@ -59,6 +68,11 @@ class EncoderService:
         else:
             worker_count = 1 if self.scheduler.policy in {"serial_fcfs", "dacc"} else self.config.executor.streams
             coro = self._worker
+        if self.config.executor.adaptive_concurrency and not batching and self.scheduler.policy not in {"serial_fcfs", "dacc"}:
+            # 弹性池：并发度**不再**在启动时定死，而是由 controller 按队列状态给出。
+            # 池子先按上界铺满，多出的 worker 阻塞在准入闸门上（见 _worker）。
+            self.controller = ConcurrencyController(self.config.executor.concurrency)
+            worker_count = self.controller.config.max_concurrency
         self._workers = [
             asyncio.create_task(coro(index), name=f"encoder-worker-{index}") for index in range(worker_count)
         ]
@@ -83,6 +97,9 @@ class EncoderService:
             future = loop.create_future()
             self.futures[job.request_id] = future
             self.metrics.record_submission()
+            if self.controller is not None:
+                self.controller.note_arrival()
+                self._awaiting_admission[job.request_id] = job.patches
         await self.queue.put((self.scheduler.rank_key(job), next(self._counter), job))
         return await asyncio.shield(future)
 
@@ -93,13 +110,56 @@ class EncoderService:
             except KeyError as exc:
                 raise JobNotFoundError(request_id) from exc
 
+    async def _await_admission(self, job: EncodeJob) -> None:
+        """准入闸门：并发度自适应时，请求在此等待直到 controller 放行。
+
+        闸门的意义是把"此刻允许几个请求共驻"变成**逐请求**的运行时决策，
+        而不是启动时的常量。等待期间**不阻塞事件循环**——CLIP 前向走
+        ``asyncio.to_thread``，闸门只是让多余的 worker 在此让出。
+
+        队列为空时 controller 返回上界，因此只要没有竞争就不会有人在这里等，
+        与"零等待"原则一致（本课题实测：愿意等待在任何负载下都是纯损失）。
+        """
+        controller = self.controller
+        assert controller is not None
+        while True:
+            # 所有 worker 共享同一等待快照。旧实现只传 [job.patches]，使“混合比例”
+            # 退化为 0%/100%，并随恰好抢到 CPU 的 worker 改变，实际上没有观察队列。
+            awaiting = list(self._awaiting_admission.values())
+            # 只有当前请求且 GPU 上无人执行时，确实没有竞争者，走 Bless 的空闲路径。
+            # 已有驻留请求时，即使只剩当前任务，它也会与驻留任务竞争，仍按尺寸分类。
+            pending = [] if controller.resident() == 0 and len(awaiting) == 1 else awaiting
+            target = controller.target_concurrency(pending)
+            if controller.resident() < target:
+                resident_before = controller.resident()
+                controller.note_start()
+                if resident_before == 0:
+                    self._drift_solo_candidates.add(job.request_id)
+                else:
+                    # 第二个请求进入后，当前所有活跃请求都受过共驻影响，不能再作为
+                    # 单请求标定样本；后续即使只剩一个，也不能恢复资格。
+                    self._drift_solo_candidates.clear()
+                self._awaiting_admission.pop(job.request_id, None)
+                job.metadata["admission"] = {
+                    "target": target,
+                    "reason": controller.last_reason(),
+                    "resident_at_admit": controller.resident(),
+                    "waiting_at_decision": len(awaiting),
+                }
+                return
+            await asyncio.sleep(0.001)
+
     async def _worker(self, worker_id: int) -> None:
         while True:
             _, _, job = await self.queue.get()
             if self.scheduler.policy == "dacc":
                 await self._run_dacc_batch(job, worker_id)
                 continue
+            admitted = False
             try:
+                if self.controller is not None:
+                    await self._await_admission(job)
+                    admitted = True
                 job.state = JobState.RUNNING
                 job.started_ns = time.perf_counter_ns()
                 result = await asyncio.to_thread(self.encoder.encode, job, worker_id)
@@ -112,7 +172,19 @@ class EncoderService:
                 job.state = JobState.FAILED
                 job.error = f"{type(exc).__name__}: {exc}"
             finally:
+                self._awaiting_admission.pop(job.request_id, None)
                 job.finished_ns = time.perf_counter_ns()
+                if admitted and self.controller is not None:
+                    drift_eligible = job.request_id in self._drift_solo_candidates
+                    self._drift_solo_candidates.discard(job.request_id)
+                    job.metadata["admission"]["drift_sample_eligible"] = drift_eligible
+                    self.controller.note_finish(
+                        job.patches,
+                        observed_ms=job.execution_ms or 0.0,
+                        # 标定表来自单请求执行。共驻墙钟包含策略自身的争用，不能用来
+                        # 判断环境漂移；传 0 让控制器跳过非独占样本。
+                        predicted_ms=job.predicted_ms if drift_eligible else 0.0,
+                    )
                 self.metrics.record(job)
                 future = self.futures.get(job.request_id)
                 if future is not None and not future.done():

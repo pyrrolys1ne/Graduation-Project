@@ -62,12 +62,13 @@ OpenAPI 页面位于 `http://127.0.0.1:8000/docs`。
 | `scripts/experiment_sm_quota.py` | **真实 SM/TPC 配额实验**（需补丁库；本机已验证可用） |
 | `scripts/summarize_results.py` | 汇总与绘图 |
 
-重复对照支持三组：
+重复对照支持四组：
 
 ```bash
-python scripts/run_repeated_comparison.py --group baselines --repeats 5
-python scripts/run_repeated_comparison.py --group ablations --repeats 5   # DACC 消融
-python scripts/run_repeated_comparison.py --group window    --repeats 5   # K=1/4/8/16
+python scripts/run_repeated_comparison.py --group baselines   --repeats 5
+python scripts/run_repeated_comparison.py --group ablations   --repeats 5   # DACC 消融
+python scripts/run_repeated_comparison.py --group window      --repeats 5   # K=1/4/8/16
+python scripts/run_repeated_comparison.py --group concurrency --repeats 5   # 并发度控制
 ```
 
 消融通过配置覆盖实现，不需要改代码：
@@ -81,9 +82,49 @@ scheduler:
 
 `metrics.gpu_sample_interval_s` 控制 GPU 利用率采样间隔。`nvidia-smi` 返回的是瞬时快照而非区间均值，默认 0.1s；间隔过大时秒级实验只能采到个位数样本，均值不具代表性。
 
+### 并发度控制（`--group concurrency`）
+
+并发度在默认配置下是**启动时定死的**（`executor.streams`，默认 2）。开启
+`executor.adaptive_concurrency` 后，改由 `ConcurrencyController`
+（`encoder_sched/concurrency.py`）**逐请求**决定此刻允许多少请求共驻：
+
+| 队列状态 | 共驻度 | 依据 |
+|---|---|---|
+| 空 | 用整卡 | 无竞争者（Bless 式"空闲时用整卡"） |
+| 小请求（patch ≤ 100）为主 | 提高 | 小请求不随配额缩放（224 为 1.34×），SM 空转多 |
+| 大请求（patch ≥ 196）为主 | 降低 | 大请求随配额显著缩放（448 为 2.45×），自己就吃满 SM |
+| 实测/预测 > `drift_threshold` | 保守值 | 标定表在该尺寸上不可信，**不再据表决策**（本课题特色项） |
+
+控制信号全部取自**队列自身**（积压、到达率、尺寸混合），不需要 root / ncu / DCGM。
+
+**该组的对照臂**是 `static_1/2/3/4/6/8`（固定并发度扫描）与 `dynamic`，
+判据为 `dynamic` 的**逐轮配对差**优于**最佳静态档**——只看"动态 vs 固定 2"
+无法区分"动态控制有效"与"并发 4 恰好更好"。示例配置见 `config.adaptive.yaml`。
+
+⚠️ **跑之前先确认环境**。每个正式样本前，脚本会运行一个关闭自适应、单 worker、
+客户端并发为 1 的哨兵，并按尺寸计算 `execution_ms / predicted_ms`；最差尺寸的中位倍率
+超过 1.5× 时会打印“环境污染”并**抑制策略判定**。正式高并发臂的墙钟不参与污染判断，
+因为它包含策略自身的共驻争用。
+原因：WSL2 与 Windows 共享 GPU，**宿主进程在 WSL 的 `nvidia-smi` 里看不见**，
+只看利用率不足以判断整机是否空闲。
+
+预检不必随整批实验一起跑，可以**单独执行**并在环境不合格时直接中止：
+
+```bash
+python scripts/run_repeated_comparison.py --group concurrency --sentinel-only --sentinel-repeats 3
+```
+
+它按哨兵配置**去重**（concurrency 组的 7 个臂共享 1 个哨兵），结果写
+`results/sentinel_<group>/sentinel_check.json`，任一尺寸超阈值时退出码为 1。
+本机实测单次预检可在 90 秒内翻转判定（1.34× → 1.58×，最差尺寸均为 448），
+所以**至少跑 3 次**再下结论——单次预检是抽一次签，不是测一个状态。
+
+重复实验按**轮次优先**执行，并在各轮循环轮转臂顺序，避免 GPU 随时间变化与某个策略名称
+绑定。当前研究状态和下一步见 `docs/当前状态与下一步.md`。
+
 ## 资源控制边界
 
-`proxy` 后端只记录调度器给出的 SM 配额并控制并发，不声称实现硬件隔离。
+`proxy` 后端**零副作用**：它只把调度器给出的 SM 配额原样记录下来返回，**既不改变执行、也不控制并发**。并发度由执行器的 worker 数决定（`executor.streams`，或在开启 `executor.adaptive_concurrency` 后由 `ConcurrencyController` 逐请求决定），与资源后端无关。因此**任何涉及 `sm_fraction` 效力的对照都必须在 libsmctrl 后端下做**——在 `proxy` 下做等于测空气（本项目已有一次这样的无效对照被作废）。
 
 Linux 上的真实 SM/TPC 控制对接上游库 [libsmctrl](http://rtsrv.cs.unc.edu/cgit/cgit.cgi/libsmctrl.git)
 （Bakita & Anderson, *Hardware Compute Partitioning on NVIDIA GPUs*, RTAS 2023），适配器为
@@ -158,5 +199,7 @@ RTX 4060 为 24 SM、每 TPC 2 SM，共 **12 个 TPC**，因此 0.25/0.5/0.75/1.
 `sm_fraction=1.0` 的真实测量；只有资源后端确认 `enforces_sm_partition=true`（即能力探针通过）时才会
 遍历全部配额，防止把逻辑配额误当成硬件实验结果。
 
-**TPC 隔离不等于零干扰。** 实测两个并发请求即使拿到互斥的 TPC 集合，仍有约 1.8–2.3 倍的 slowdown——
-L2 与显存带宽是共享的，TPC 掩码挡不住。报告中应如实区分"TPC 集合互斥"与"性能互不影响"。
+**TPC 隔离不等于隔离 L2/HBM。** 早期“互斥 TPC 仍有 1.8–2.3× slowdown”的结论已撤回：
+独跑基准和并发测量使用了不同 TPC 位置，把位置差异误读成争用。同一掩码位置重测后，
+compute+compute / compute+memory / memory+memory 的 slowdown 约为 0.99–1.16×。
+报告中仍需区分“TPC 集合互斥”和“缓存、带宽资源隔离”；libsmctrl 只保证前者。

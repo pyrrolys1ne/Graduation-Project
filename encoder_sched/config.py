@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from .concurrency import ConcurrencyConfig
 
 
 @dataclass(frozen=True)
@@ -47,6 +49,15 @@ class ExecutorConfig:
     resource_backend: str = "proxy"
     allow_proxy_fallback: bool = True
     libsmctrl_adapter: str = ""
+    #: 是否启用**运行时并发度控制**。
+    #:
+    #: 关闭时（默认）并发度是启动时定死的 ``streams``——这是本项目此前的全部
+    #: 历史行为，保持默认关闭以保证既有结果可复现。
+    #: 打开时由 ``ConcurrencyController`` 按队列状态逐请求决定共驻数，
+    #: 见 ``encoder_sched/concurrency.py`` 的模块说明。
+    adaptive_concurrency: bool = False
+    #: 并发度控制器的参数。仅当 ``adaptive_concurrency`` 为真时生效。
+    concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
 
 
 @dataclass(frozen=True)
@@ -110,6 +121,27 @@ def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
     return value
 
 
+def _make_executor_config(data: dict[str, Any]) -> ExecutorConfig:
+    """从 YAML 段构造 ExecutorConfig。
+
+    需要单独处理是因为 ``concurrency`` 是**嵌套 dataclass**：直接
+    ``ExecutorConfig(**data)`` 会把 YAML 里的 dict 原样塞进去，之后访问
+    ``config.executor.concurrency.max_concurrency`` 才在运行时炸——
+    而那时离出错地点已经很远。这里显式展开，并把未知键拦在加载阶段。
+    """
+    payload = dict(data)
+    concurrency_data = payload.pop("concurrency", None)
+    if concurrency_data is None:
+        return ExecutorConfig(**payload)
+    if not isinstance(concurrency_data, dict):
+        raise ValueError("executor.concurrency 必须是映射")
+    known = {item.name for item in fields(ConcurrencyConfig)}
+    unknown = sorted(set(concurrency_data) - known)
+    if unknown:
+        raise ValueError(f"executor.concurrency 含未知字段: {unknown}；可用字段: {sorted(known)}")
+    return ExecutorConfig(concurrency=ConcurrencyConfig(**concurrency_data), **payload)
+
+
 def load_config(path: str | Path = "config.yaml") -> AppConfig:
     config_path = Path(path).resolve()
     with config_path.open("r", encoding="utf-8") as handle:
@@ -126,7 +158,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     config = AppConfig(
         model=ModelConfig(**model_data),
         scheduler=SchedulerConfig(**scheduler_data),
-        executor=ExecutorConfig(**_section(data, "executor")),
+        executor=_make_executor_config(_section(data, "executor")),
         profiling=ProfilingConfig(**_section(data, "profiling")),
         logging=LoggingConfig(**_section(data, "logging")),
         batching=BatchingConfig(**_section(data, "batching")),
@@ -145,17 +177,16 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     if not config.scheduler.quota_levels or any(not 0 < value <= 1 for value in config.scheduler.quota_levels):
         raise ValueError("quota_levels 必须位于 (0, 1]")
     if config.scheduler.dacc_overrides:
-        from dataclasses import fields as _fields
-
         from .dacc import DaccConfig
 
-        fields = {item.name: item.type for item in _fields(DaccConfig)}
-        unknown = sorted(set(config.scheduler.dacc_overrides) - set(fields))
+        # 局部名刻意不叫 fields——那会遮蔽从 dataclasses 导入的同名函数。
+        dacc_fields = {item.name: item.type for item in fields(DaccConfig)}
+        unknown = sorted(set(config.scheduler.dacc_overrides) - set(dacc_fields))
         if unknown:
-            raise ValueError(f"dacc_overrides 含未知字段: {unknown}；可用字段: {sorted(fields)}")
+            raise ValueError(f"dacc_overrides 含未知字段: {unknown}；可用字段: {sorted(dacc_fields)}")
         # dataclasses.replace 不做类型检查，值写错会一路带到运行时才崩。
         # DaccConfig 的字段全是数值，这里直接拦住。
         for key, value in config.scheduler.dacc_overrides.items():
-            if fields[key] in {"int", "float"} and not isinstance(value, (int, float)):
+            if dacc_fields[key] in {"int", "float"} and not isinstance(value, (int, float)):
                 raise ValueError(f"dacc_overrides.{key} 应为数值，实际为 {type(value).__name__}: {value!r}")
     return config
