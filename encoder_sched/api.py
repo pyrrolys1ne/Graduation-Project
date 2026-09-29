@@ -93,6 +93,23 @@ def build_service(config: AppConfig, fake: bool = False) -> EncoderService:
         quota_policy=config.scheduler.quota_policy,
     )
     _ensure_libsmctrl_target(config, fake)
+    if config.executor.graph_pipeline:
+        if fake:
+            raise ValueError(
+                "graph_pipeline 需要真实 CUDA 执行路径：FakeEncoderBackend 没有模型、没有 CUDA 流，"
+                "无法捕获 CUDA Graph。需要无 GPU 验证链路时请关闭 executor.graph_pipeline。"
+            )
+        graph_config = config.executor.graph
+        if not graph_config.sizes:
+            # 尺寸留空时从剖析表推导：那张表就是"本机跑过哪些尺寸"的权威记录，
+            # 比在代码里再抄一份常量更不容易漂移。
+            sizes = tuple(sorted({
+                (int(row.width), int(row.height)) for row in performance.table.itertuples()
+            }))
+            if not sizes:
+                raise ValueError("剖析表里没有任何 (width, height)，无法推导图池尺寸")
+            graph_config = replace(graph_config, sizes=sizes)
+            config = replace(config, executor=replace(config.executor, graph=graph_config))
     resource = create_resource_backend(
         config.executor.resource_backend,
         config.executor.libsmctrl_adapter,

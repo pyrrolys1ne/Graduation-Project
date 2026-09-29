@@ -7,6 +7,7 @@ from typing import Any
 import yaml
 
 from .concurrency import ConcurrencyConfig
+from .graph_runtime import GraphRuntimeConfig
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,15 @@ class ExecutorConfig:
     adaptive_concurrency: bool = False
     #: 并发度控制器的参数。仅当 ``adaptive_concurrency`` 为真时生效。
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
+    #: 是否启用**图回放流水线**（`encoder_sched/graph_runtime.py`）。
+    #:
+    #: 关闭时（默认）每个请求走 eager 前向——这是本项目此前的全部历史行为。
+    #: 打开时把"CPU 造图"与"CUDA Graph 回放"拆成两级、两个线程池，
+    #: 并发度由 ``graph.slots`` 给出。**与 ``resource_backend=libsmctrl`` 互斥**
+    #: （掩码在 graph 回放时不生效，见实验记录 §10.7），构造时会直接拒绝。
+    graph_pipeline: bool = False
+    #: 图回放流水线的参数。仅当 ``graph_pipeline`` 为真时生效。
+    graph: GraphRuntimeConfig = field(default_factory=GraphRuntimeConfig)
 
 
 @dataclass(frozen=True)
@@ -131,15 +141,41 @@ def _make_executor_config(data: dict[str, Any]) -> ExecutorConfig:
     """
     payload = dict(data)
     concurrency_data = payload.pop("concurrency", None)
-    if concurrency_data is None:
-        return ExecutorConfig(**payload)
-    if not isinstance(concurrency_data, dict):
-        raise ValueError("executor.concurrency 必须是映射")
-    known = {item.name for item in fields(ConcurrencyConfig)}
-    unknown = sorted(set(concurrency_data) - known)
+    graph_data = payload.pop("graph", None)
+    if concurrency_data is not None:
+        payload["concurrency"] = _nested_config(
+            "executor.concurrency", concurrency_data, ConcurrencyConfig)
+    if graph_data is not None:
+        payload["graph"] = _nested_config("executor.graph", graph_data, GraphRuntimeConfig)
+    return ExecutorConfig(**payload)
+
+
+def _nested_config(section: str, data: Any, target: type) -> Any:
+    """把一个 YAML 段展开成嵌套 dataclass，未知键在加载阶段就拦住。
+
+    直接 ``Target(**data)`` 会把 YAML 里的 dict 原样塞进去，之后访问
+    ``config.<...>.max_concurrency`` 才在运行时炸——而那时离出错地点已经很远。
+    """
+    if not isinstance(data, dict):
+        raise ValueError(f"{section} 必须是映射")
+    payload = dict(data)
+    # sizes 在 YAML 里写成 [[224, 224], ...]，dataclass 里是 tuple of tuple。
+    if section == "executor.graph" and "sizes" in payload:
+        payload["sizes"] = tuple(tuple(int(v) for v in pair) for pair in payload["sizes"])
+    if section == "executor.graph" and "batch_by_size" in payload:
+        # YAML 里写成 ``{224: 4, 336: 4}``：键是**正方形边长**（本项目全部尺寸都是方的），
+        # 值是允许的最大批大小。转成 ((w, h, batch), ...) 以保持 dataclass 不可变。
+        raw = payload["batch_by_size"] or {}
+        if not isinstance(raw, dict):
+            raise ValueError("executor.graph.batch_by_size 必须是映射（边长 → 批上限）")
+        payload["batch_by_size"] = tuple(
+            (int(side), int(side), int(batch)) for side, batch in raw.items()
+        )
+    known = {item.name for item in fields(target)}
+    unknown = sorted(set(payload) - known)
     if unknown:
-        raise ValueError(f"executor.concurrency 含未知字段: {unknown}；可用字段: {sorted(known)}")
-    return ExecutorConfig(concurrency=ConcurrencyConfig(**concurrency_data), **payload)
+        raise ValueError(f"{section} 含未知字段: {unknown}；可用字段: {sorted(known)}")
+    return target(**payload)
 
 
 def load_config(path: str | Path = "config.yaml") -> AppConfig:
@@ -168,6 +204,46 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     )
     if config.executor.streams < 1:
         raise ValueError("executor.streams 必须大于 0")
+    if config.executor.graph_pipeline:
+        if config.executor.resource_backend == "libsmctrl":
+            raise ValueError(
+                "graph_pipeline 与 resource_backend=libsmctrl 互斥：libsmctrl 的掩码回调挂在 "
+                "kernel 发射路径上，而 graph 回放走 cuGraphLaunch、绕开了它（实验记录 §10.7）。"
+                "两者同用会得到一份'看起来限了 SM、实际没限'的结果。"
+            )
+        if config.executor.graph.slots < 1:
+            raise ValueError("executor.graph.slots 必须大于 0")
+        if config.executor.graph.prep_threads < 1:
+            raise ValueError("executor.graph.prep_threads 必须大于 0")
+        for width, height, batch in config.executor.graph.batch_by_size:
+            if batch < 1:
+                raise ValueError(f"executor.graph.batch_by_size 的批上限必须 ≥1，实际 {batch}")
+            # 尺寸必须真的被捕获：批图是按 batch_by_size 表捕获的，表里出现一个
+            # 不在 sizes 里的尺寸，只会静默地永远用不上（而它本意是要生效的）。
+            if config.executor.graph.sizes and (width, height) not in config.executor.graph.sizes:
+                raise ValueError(
+                    f"executor.graph.batch_by_size 含尺寸 {width}×{height}，"
+                    f"但它不在 executor.graph.sizes 里——那张表决定捕获哪些图。"
+                )
+        # 回放槽位与 CUDA 流要一一对应：``replay`` 按 slot_index 选流，
+        # 流比槽位少会让两个槽位挤在同一条流上，回放并发被静默地压回流数。
+        if config.executor.graph.slots > config.executor.streams:
+            raise ValueError(
+                f"executor.graph.slots({config.executor.graph.slots}) 不能大于 "
+                f"executor.streams({config.executor.streams})：每个回放槽位需要自己的 CUDA 流，"
+                "否则两个槽位会挤在同一条流上、回放并发被静默压回流数。"
+            )
+        if config.executor.adaptive_concurrency:
+            raise ValueError(
+                "graph_pipeline 与 adaptive_concurrency 不能同时启用：两者的并发度来自两个不同的"
+                "旋钮（graph.slots 与 ConcurrencyController），同时开会有一方静默失效。"
+            )
+        if config.batching.max_batch > 1:
+            raise ValueError(
+                "graph_pipeline 与 batching 段不能同时启用：`batching` 是 **eager 路径**的"
+                "组批实现（`_batch_worker`），而图路径有自己的组批——`executor.graph.batch_by_size`。"
+                "两套逻辑同时决定'一次处理几个请求'会让归因失效。"
+            )
     if config.metrics.gpu_sample_interval_s <= 0:
         raise ValueError("metrics.gpu_sample_interval_s 必须大于 0")
     if config.batching.max_batch < 1:

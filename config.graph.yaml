@@ -1,0 +1,60 @@
+# 图回放流水线（Graph-Replay Pipeline）的一个可直接运行示例。
+#
+# 与 config.yaml 的差别只在 executor 段：
+#   graph_pipeline: true  → 每个请求走"CPU 准备 → 图回放"两级流水线
+#   graph.slots: 1        → 回放级并发 = 1（**唯一安全的档位**，见下）
+#   graph.prep_threads: 2 → 预处理级并发 = 2（独立旋钮）
+#
+# 机制与依据见 encoder_sched/graph_runtime.py 的模块说明与 docs/实验记录.md §23。
+#
+# ⚠️ graph.slots 必须为 1。多 lane 并发图回放会挂死（所有线程卡在 stream.synchronize()、
+#    GPU 永不完结），预取结构下实测 4/6 次运行挂死。把"图在 GPU 上的执行"串行化
+#    可以消除挂死，但那等于变回单 lane（吞吐 221 对 222），所以直接用单 lane。
+#    全部实测见 docs/实验记录.md §25。
+# 三条硬约束（配置加载阶段就会拦住）：
+#   1. 与 resource_backend=libsmctrl 互斥——掩码在 graph 回放时不生效（§10.7）。
+#   2. 与 adaptive_concurrency 互斥——并发度只能有一个来源。
+#   3. 与 batching 互斥——本版图不含批维。
+#
+# 用法：
+#   ENCODER_SCHED_CONFIG=config.graph.yaml .venv-linux/bin/python -m encoder_sched.api
+
+model:
+  name: openai/clip-vit-base-patch32
+  dtype: float16
+  local_files_only: true
+scheduler:
+  policy: edf_size
+  deadline_tie_ms: 5.0
+  quota_levels: [0.25, 0.5, 0.75, 1.0]
+executor:
+  # 回放槽位按 slot_index 选流，因此流数必须 ≥ 槽位数。
+  streams: 2
+  resource_backend: proxy
+  allow_proxy_fallback: true
+  libsmctrl_adapter: ""
+  graph_pipeline: true
+  graph:
+    slots: 1
+    prep_threads: 2
+    # 留空（写成 sizes: []）则从剖析表推导本机跑过哪些尺寸。
+    sizes: [[224, 224], [336, 336], [448, 448], [672, 672]]
+    # 每个尺寸允许的**批上限**；不写（或留空）表示全部按 batch=1，即关闭成批。
+    #
+    # 批上限按尺寸给，取值来自实测收益（单流 B=4 相对 B=1）：
+    #   224 2.42× / 336 1.79× / 448 1.38× / 672 1.16×
+    # 小请求批次内填空转的空间大、大请求几乎没有；而批越大单批墙钟越长
+    # （672 的 B=4 是 19.2 ms 对 B=1 的 5.4 ms），尾延迟风险实打实。
+    #
+    # ⚠️ 组批**绝不等待**（只取队列里已经存在的同尺寸请求），所以这里只封顶、
+    #    不引入等待成本。这也是 §7 那条结论（"需要等待才能组批的时刻，
+    #    恰恰是不值得组批的时刻"）在本实现里的落点。
+    # batch_by_size: {224: 4, 336: 4, 448: 2, 672: 1}
+profiling:
+  table_path: data/profiles/default.csv
+logging:
+  output_dir: results
+  request_log: requests.jsonl
+seed: 20260902
+metrics:
+  gpu_sample_interval_s: 0.1

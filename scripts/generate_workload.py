@@ -8,6 +8,22 @@ from pathlib import Path
 
 SIZES = (224, 336, 448, 672)
 
+#: deadline 的固定下限（毫秒）。这一项覆盖请求到达服务端到开始执行之间的固定开销
+#: （HTTP 往返、事件循环、线程调度）；不含它会让 deadline 比实际可达的端到端延迟还短。
+SLO_FLOOR_MS = 10.0
+
+#: 单请求的**串行执行**服务时间（毫秒），即"什么都不做"这个参照系的服务时间。
+#: deadline 由它乘以 ``slo_factor`` 得到。
+#:
+#: ⚠️ **这是一组实测值，必须随测量口径更新。** 取值来自 2026-09-26 在本机对
+#: `multistream_fcfs` + `streams=1` 的测量（`execution_ms` 中位，每尺寸 10 次）。
+#: 上一版用的是图回放之前的旧值（224/336/448/672 = 6/13/22/50 ms），
+#: 其中 336/448/672 **偏高 2–4 倍**——用旧值生成的 deadline 对今天的快路径
+#: 过松，SLO 违约率会恒为 0、失去区分度（§21.3 遇到的正是这个问题的另一个极端）。
+#:
+#: 换硬件、换模型或换推理栈之后，必须重新测这组数，否则 SLO 这一项没有意义。
+BASE_LATENCY_MS = {224: 4.73, 336: 4.08, 448: 4.97, 672: 7.83}
+
 
 def generate(count: int, pattern: str, seed: int, slo: str, arrival_ms: float = 20.0) -> list[dict]:
     """`arrival_ms` 是平均到达间隔（毫秒），直接决定到达率。
@@ -19,7 +35,6 @@ def generate(count: int, pattern: str, seed: int, slo: str, arrival_ms: float = 
     """
     rng = random.Random(seed)
     slo_factor = {"tight": 1.5, "normal": 3.0, "loose": 6.0}[slo]
-    base_latency = {224: 6.0, 336: 13.0, 448: 22.0, 672: 50.0}
     rows = []
     current_ms = 0.0
     for index in range(count):
@@ -38,7 +53,7 @@ def generate(count: int, pattern: str, seed: int, slo: str, arrival_ms: float = 
                 "seed": seed + index,
                 "width": size,
                 "height": size,
-                "deadline_ms": round(base_latency[size] * slo_factor + 50.0, 3),
+                "deadline_ms": round(BASE_LATENCY_MS[size] * slo_factor + SLO_FLOOR_MS, 3),
                 "priority": rng.choice([0, 0, 0, 1]),
             }
         )

@@ -10,6 +10,7 @@ from typing import Any
 from .concurrency import ConcurrencyConfig, ConcurrencyController
 from .config import AppConfig
 from .encoder import EncoderBackend
+from .graph_runtime import GraphReplayRuntime, GraphRuntimeConfig
 from .metrics import GpuUtilizationSampler, MetricsStore
 from .models import EncodeJob, JobState
 from .resource import ResourceBackend
@@ -48,6 +49,15 @@ class EncoderService:
         #: 运行时并发控制器。仅在 ``executor.adaptive_concurrency`` 打开时非 None，
         #: 否则并发度仍是启动时定死的 ``executor.streams``（历史行为，保持可复现）。
         self.controller: ConcurrencyController | None = None
+        #: 图回放流水线运行时。仅在 ``executor.graph_pipeline`` 打开时非 None。
+        #: 它同时是"并发度的来源"（``graph.slots``）与"两级流水线的执行体"。
+        self.graph: GraphReplayRuntime | None = None
+        #: 图回放流水线的**预处理级 → 回放级**队列。两级拆成两个协程是这一级的全部意义：
+        #: 合并成一个协程会让"准备下一个"与"回放当前"串行，实测把 `slots=1` 的服务吞吐
+        #: 从应当的约 300 req/s 压到 **141 req/s**（几乎等于 eager 基线 129.3），
+        #: 等于把图回放的收益整个吃掉。
+        self._prepared: asyncio.Queue[tuple[EncodeJob, Any]] = asyncio.Queue()
+        self._preparers: list[asyncio.Task[None]] = []
         # 已提交但尚未通过准入闸门的请求。worker 会先从 PriorityQueue 取走任务再等待
         # 准入，因此只看 queue 无法得到真实等待集合；必须在服务层单独建账。
         self._awaiting_admission: dict[str, int] = {}
@@ -61,14 +71,33 @@ class EncoderService:
                 "批处理与 dacc 策略不能同时启用：dacc 自己就要在同一窗口内挑选 2 个请求并发执行，"
                 "再叠加批处理会让'一次前向处理几个请求'这件事被两套逻辑同时决定。"
             )
-        if batching:
+        if self.config.executor.graph_pipeline:
+            if self.scheduler.policy in {"serial_fcfs", "dacc"}:
+                raise ValueError(
+                    f"graph_pipeline 不支持 scheduler.policy={self.scheduler.policy}："
+                    "该策略自带单 worker 的串行编排，与'并发度来自 graph.slots'冲突。"
+                )
+            # 图回放流水线：并发度来自 graph.slots，两级线程池由 runtime 内部持有。
+            self.graph = GraphReplayRuntime(
+                self.encoder, self.config.executor.graph, self.resource_backend
+            )
+            worker_count = self.graph.config.slots
+            coro = self._graph_worker
+            # 预处理级：与回放 lane 数量解耦，由 graph.prep_threads 给出。
+            self._preparers = [
+                asyncio.create_task(self._graph_preparer(index),
+                                    name=f"graph-prep-{index}")
+                for index in range(max(1, self.graph.config.prep_threads))
+            ]
+        elif batching:
             # 批处理模式下由单个 worker 组批，并发度来自 batch 而不是多 worker
             worker_count = 1
             coro = self._batch_worker
         else:
             worker_count = 1 if self.scheduler.policy in {"serial_fcfs", "dacc"} else self.config.executor.streams
             coro = self._worker
-        if self.config.executor.adaptive_concurrency and not batching and self.scheduler.policy not in {"serial_fcfs", "dacc"}:
+        if (self.config.executor.adaptive_concurrency and not batching and self.graph is None
+                and self.scheduler.policy not in {"serial_fcfs", "dacc"}):
             # 弹性池：并发度**不再**在启动时定死，而是由 controller 按队列状态给出。
             # 池子先按上界铺满，多出的 worker 阻塞在准入闸门上（见 _worker）。
             self.controller = ConcurrencyController(self.config.executor.concurrency)
@@ -83,6 +112,11 @@ class EncoderService:
         for worker in self._workers:
             worker.cancel()
         await asyncio.gather(*self._workers, return_exceptions=True)
+        for preparer in self._preparers:
+            preparer.cancel()
+        await asyncio.gather(*self._preparers, return_exceptions=True)
+        if self.graph is not None:
+            self.graph.close()
         self.gpu_sampler.stop()
         output_dir = self.config.resolve(self.config.logging.output_dir)
         self.metrics.export_csv(output_dir / "requests.csv")
@@ -190,6 +224,134 @@ class EncoderService:
                 if future is not None and not future.done():
                     future.set_result(job)
                 self.queue.task_done()
+
+    async def _collect_batch(self, first: EncodeJob, cap: int) -> list[EncodeJob]:
+        """从队列里凑一批**同尺寸**的请求，**绝不为凑批等待**。
+
+        §7 的教训：「需要等待才能组批的时刻，恰恰是不值得组批的时刻」——
+        等待在任何负载下都是纯损失（欠饱和时只抬高 SLO 违约率，过载时队列本就有积压、
+        不等也凑得到）。因此这里只做 `get_nowait`，一次都不 sleep。
+
+        批处理要求同形状，而请求尺寸在队列里是交错的（224/336/448/672 循环到达），
+        只看队首的下一个必然凑不成批——所以要向后扫一段，把非同尺寸的原样放回。
+        这与既有 `_batch_worker` 的扫描逻辑是同一个道理。
+        """
+        runtime = self.graph
+        assert runtime is not None
+        if cap <= 1:
+            return [first]
+        group = [first]
+        others: list[EncodeJob] = []
+        scanned = 0
+        limit = cap * runtime.config.batch_scan_factor
+        while len(group) < cap and scanned < limit:
+            try:
+                _, _, candidate = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            scanned += 1
+            if (candidate.width, candidate.height) == (first.width, first.height):
+                group.append(candidate)
+            else:
+                others.append(candidate)
+        for job in others:
+            # put 之后必须补一次 task_done：`put` 会让 unfinished_tasks 加一，
+            # 而这一条已经在 `submit` 时计过一次了。少了它 `queue.join()` 会永远等下去。
+            await self.queue.put((self.scheduler.rank_key(job), next(self._counter), job))
+            self.queue.task_done()
+        return group
+
+    async def _graph_preparer(self, index: int) -> None:
+        """预处理级：从请求队列取件、按尺寸凑批、在预处理线程池上造图，交给回放级。
+
+        **与回放级分成两个协程是这一级的全部意义。** 合并成一个协程会让
+        "准备下一个"与"回放当前"串行——实测把 `slots=1` 的服务吞吐从应当的
+        约 300 req/s 压到 **141 req/s**（几乎等于 eager 基线 129.3），
+        等于把图回放的收益整个吃掉。
+
+        **凑批是这一级的第二个职责**（`graph.batch_by_size` 非空时生效）：
+        批在预处理级按尺寸组好，回放级只负责"一次前向处理这一批"。
+        两个并行度（`graph.prep_threads` / `graph.slots`）与批上限因此是三个解耦的旋钮。
+        """
+        runtime = self.graph
+        assert runtime is not None
+        while True:
+            _, _, first = await self.queue.get()
+            if not runtime.supports(first):
+                self._finish_graph_job(first, error=(
+                    f"尺寸 {first.width}×{first.height} 未在图池中。图必须在启动阶段捕获"
+                    "（中途捕获要求显存上没有在飞的图），请把它加进 executor.graph.sizes。"
+                ))
+                continue
+            jobs = await self._collect_batch(first, runtime.batch_capacity(first))
+            try:
+                prepared = await runtime.aprepare(jobs)
+            except Exception as exc:  # noqa: BLE001 - 预处理失败也要把这一批收尾
+                error = f"{type(exc).__name__}: {exc}"
+                for job in jobs:
+                    self._finish_graph_job(job, error=error)
+                continue
+            await self._prepared.put((jobs, prepared))
+
+    async def _graph_worker(self, worker_id: int) -> None:
+        """回放级（一条 lane）：一条流、一份图实例、一个并发槽位。
+
+        只做两件事：从预处理级取件、调 ``runtime.replay``。**不做 CPU 造图**——
+        把两者放在同一个线程里会挂死（``graph_runtime`` 模块 docstring 的二分表）：
+        CPU 有持续负载、且另一条流上有图在回放时，所有线程会卡在各自的
+        ``stream.synchronize()`` 上互等。
+
+        ``worker_id`` 同时是**槽位号**：``graph.slots`` == 回放 lane 数，
+        ``slots <= streams`` 由配置校验保证，因此每个槽位独占一条流与一份图实例。
+        """
+        runtime = self.graph
+        assert runtime is not None
+        while True:
+            jobs, prepared = await self._prepared.get()
+            started_ns = time.perf_counter_ns()
+            for job in jobs:
+                job.state = JobState.RUNNING
+                # 批内各请求同时开始、同时结束，因此共享同一个 started_ns
+                job.started_ns = started_ns
+            try:
+                results = await asyncio.to_thread(runtime.replay, jobs, worker_id, prepared)
+            except Exception as exc:  # noqa: BLE001 - 整批一起失败
+                error = f"{type(exc).__name__}: {exc}"
+                for job in jobs:
+                    self._finish_graph_job(job, error=error)
+                continue
+            for job, result in zip(jobs, results):
+                job.embedding_dim = result["embedding_dim"]
+                job.embedding_norm = result["embedding_norm"]
+                job.execution_ms = result["execution_ms"]
+                job.metadata["resource"] = result["resource"]
+                # prepare_ms 与 execution_ms 一起构成"两级各花了多少"的原始记录；
+                # batch 记下这一批实际几条——**成批臂的判据全靠它**：
+                # 没有它就无法区分"成批没生效（batch 恒为 1）"与"成批生效但没收益"，
+                # 而本项目历史上真的发生过平均批大小恒为 1.00 的无效批次（§14）。
+                job.metadata["graph_pipeline"] = {
+                    "slot": worker_id,
+                    "prepare_ms": prepared.cpu_ms,
+                    "size": f"{job.width}x{job.height}",
+                    "batch": len(jobs),
+                }
+                job.state = JobState.COMPLETED
+                self._finish_graph_job(job)
+
+    def _finish_graph_job(self, job: EncodeJob, error: str | None = None) -> None:
+        """图回放路径的统一收尾：**只有这里会调 task_done**。
+
+        预处理级失败与回放级失败都走这一个出口，否则 `queue.join()` 会漏计。
+        """
+        if error is not None:
+            job.state = JobState.FAILED
+            job.error = error
+        job.finished_ns = time.perf_counter_ns()
+        self.metrics.record(job)
+        future = self.futures.get(job.request_id)
+        if future is not None and not future.done():
+            future.set_result(job)
+        self.queue.task_done()
 
     async def _batch_worker(self, worker_id: int) -> None:
         """批处理 worker：从队列收集**同尺寸**请求凑成一批，一次前向完成。
@@ -334,4 +496,5 @@ class EncoderService:
             "streams": len(self._workers),
             "environment": self.encoder.environment(),
             "resource": self.resource_backend.describe() if self.resource_backend else None,
+            "graph_pipeline": self.graph.describe() if self.graph is not None else None,
         }
