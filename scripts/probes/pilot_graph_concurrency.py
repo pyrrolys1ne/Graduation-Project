@@ -50,10 +50,9 @@ GPU 永不完结）。H2D 的源用锁页可以缓解，但**不能消除**—�
    N≥3 时应 ≈ GPU span（§22.3 的形态）；graph 臂应显著更低。
 
 用法：
-    .venv-linux/bin/python scripts/probes/pilot_graph_concurrency.py
-    .venv-linux/bin/python scripts/probes/pilot_graph_concurrency.py --concurrencies 1,2,4 --duration 4
+    .venv/bin/python scripts/probes/pilot_graph_concurrency.py
+    .venv/bin/python scripts/probes/pilot_graph_concurrency.py --concurrencies 1,2,4 --duration 4
 
-⚠️ 本脚本会独占 GPU（默认约 6–8 分钟），跑之前先确认宿主侧空闲。
 """
 
 from __future__ import annotations

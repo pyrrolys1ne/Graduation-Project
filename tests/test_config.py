@@ -25,6 +25,41 @@ def test_defaults_are_usable(tmp_path):
     config = load_config(write(tmp_path))
     assert config.scheduler.policy == "edf_size"
     assert config.metrics.gpu_sample_interval_s > 0
+    assert config.runtime.require_linux is True
+    assert config.runtime.min_python == (3, 10)
+    assert config.executor.resource_backend == "none"
+    assert config.executor.allow_proxy_fallback is False
+    assert config.scheduler.quota_levels == (1.0,)
+    assert config.scheduler.quota_policy == "full"
+
+
+def test_proxy_fallback_is_rejected_for_none_backend(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.safe_dump({"executor": {"resource_backend": "none", "allow_proxy_fallback": True}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="allow_proxy_fallback"):
+        load_config(path)
+
+
+def test_runtime_min_python_is_parsed(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({"runtime": {"min_python": [3, 11]}}), encoding="utf-8")
+    assert load_config(path).runtime.min_python == (3, 11)
+
+
+def test_none_backend_rejects_virtual_quota_levels(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.safe_dump({
+            "scheduler": {"quota_levels": [0.5, 1.0], "quota_policy": "deadline_min"},
+            "executor": {"resource_backend": "none"},
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="不实施配额"):
+        load_config(path)
 
 
 def test_valid_dacc_overrides_accepted(tmp_path):

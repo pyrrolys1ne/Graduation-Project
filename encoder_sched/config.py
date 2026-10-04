@@ -28,13 +28,23 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class RuntimeConfig:
+    """原生 Linux GPU 服务器的启动约束。"""
+
+    require_linux: bool = True
+    require_cuda: bool = True
+    min_python: tuple[int, int] = (3, 10)
+    max_cuda_major: int = 13
+
+
+@dataclass(frozen=True)
 class SchedulerConfig:
     policy: str = "edf_size"
     deadline_tie_ms: float = 5.0
-    quota_levels: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
+    quota_levels: tuple[float, ...] = (1.0,)
     #: 配额选择策略：deadline_min（历史行为，"最小可行配额"）或 full（始终用满）。
     #: 详见 encoder_sched/scheduler.py 的 choose_quota。
-    quota_policy: str = "deadline_min"
+    quota_policy: str = "full"
     dacc_window: int = 8
     dacc_beta: float = 1.0
     dacc_guard_ms: float = 5.0
@@ -47,8 +57,8 @@ class SchedulerConfig:
 @dataclass(frozen=True)
 class ExecutorConfig:
     streams: int = 2
-    resource_backend: str = "proxy"
-    allow_proxy_fallback: bool = True
+    resource_backend: str = "none"
+    allow_proxy_fallback: bool = False
     libsmctrl_adapter: str = ""
     #: 是否启用**运行时并发度控制**。
     #:
@@ -109,6 +119,7 @@ class MetricsConfig:
 
 @dataclass(frozen=True)
 class AppConfig:
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     executor: ExecutorConfig = field(default_factory=ExecutorConfig)
@@ -178,6 +189,16 @@ def _nested_config(section: str, data: Any, target: type) -> Any:
     return target(**payload)
 
 
+def _make_runtime_config(data: dict[str, Any]) -> RuntimeConfig:
+    payload = dict(data)
+    if "min_python" in payload:
+        value = payload["min_python"]
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError("runtime.min_python 必须写成 [major, minor]")
+        payload["min_python"] = (int(value[0]), int(value[1]))
+    return _nested_config("runtime", payload, RuntimeConfig)
+
+
 def load_config(path: str | Path = "config.yaml") -> AppConfig:
     config_path = Path(path).resolve()
     with config_path.open("r", encoding="utf-8") as handle:
@@ -192,6 +213,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     if "quota_levels" in scheduler_data:
         scheduler_data = {**scheduler_data, "quota_levels": tuple(scheduler_data["quota_levels"])}
     config = AppConfig(
+        runtime=_make_runtime_config(_section(data, "runtime")),
         model=ModelConfig(**model_data),
         scheduler=SchedulerConfig(**scheduler_data),
         executor=_make_executor_config(_section(data, "executor")),
@@ -204,6 +226,21 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     )
     if config.executor.streams < 1:
         raise ValueError("executor.streams 必须大于 0")
+    if config.executor.resource_backend not in {"none", "libsmctrl", "proxy"}:
+        raise ValueError("executor.resource_backend 必须是 none、libsmctrl 或历史兼容值 proxy")
+    if config.executor.resource_backend == "none" and config.executor.allow_proxy_fallback:
+        raise ValueError("resource_backend=none 时 allow_proxy_fallback 必须关闭")
+    if config.executor.resource_backend == "none" and (
+        config.scheduler.quota_levels != (1.0,) or config.scheduler.quota_policy != "full"
+    ):
+        raise ValueError(
+            "resource_backend=none 不实施配额，scheduler 必须使用 quota_levels=[1.0] "
+            "且 quota_policy=full，避免预测配额与实际执行不一致"
+        )
+    if config.runtime.min_python < (3, 10):
+        raise ValueError("runtime.min_python 不能低于项目要求的 Python 3.10")
+    if config.runtime.max_cuda_major < 1:
+        raise ValueError("runtime.max_cuda_major 必须为正整数")
     if config.executor.graph_pipeline:
         if config.executor.resource_backend == "libsmctrl":
             raise ValueError(

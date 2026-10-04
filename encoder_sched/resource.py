@@ -41,8 +41,10 @@ class ResourceBackend(ABC):
 
 
 @dataclass
-class ProxyResourceBackend(ResourceBackend):
-    name: str = "proxy"
+class NoopResourceBackend(ResourceBackend):
+    """不做 SM 隔离的显式后端，用于共享 GPU 并发与批处理主实验。"""
+
+    name: str = "none"
     enforces_sm_partition: bool = False
     fallback_reason: str | None = None
 
@@ -50,24 +52,31 @@ class ProxyResourceBackend(ResourceBackend):
         _validate_fraction(sm_fraction)
         return {
             "backend": self.name,
-            "configured_backend": "proxy",
+            "configured_backend": self.name,
             "effective_backend": self.name,
             "requested_sm_fraction": sm_fraction,
             "enforced": False,
             "fallback": self.fallback_reason is not None,
             "reason": self.fallback_reason
-            or "代理后端只记录配额并控制并发，不实现 SM 硬件隔离。",
+            or "none 后端不实施 SM 隔离；请求共享 GPU，由 CUDA 调度并发 kernel。",
         }
 
     def describe(self) -> dict[str, Any]:
         result = super().describe()
         result.update(
-            configured_backend="libsmctrl" if self.fallback_reason else "proxy",
+            configured_backend="libsmctrl" if self.fallback_reason else self.name,
             fallback_active=self.fallback_reason is not None,
             fallback_reason=self.fallback_reason,
-            capability="proxy_only",
+            capability="no_sm_partition",
         )
         return result
+
+
+@dataclass
+class ProxyResourceBackend(NoopResourceBackend):
+    """旧实验兼容别名；新服务器配置应使用 ``none``。"""
+
+    name: str = "proxy"
 
 
 class LibSmCtrlBackend(ResourceBackend):
@@ -169,6 +178,8 @@ def _normalize_adapter_result(raw_result: Any) -> dict[str, Any]:
 
 
 def create_resource_backend(name: str, adapter: str, allow_proxy_fallback: bool) -> ResourceBackend:
+    if name == "none":
+        return NoopResourceBackend()
     if name == "proxy":
         return ProxyResourceBackend()
     if name != "libsmctrl":

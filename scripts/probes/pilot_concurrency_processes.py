@@ -14,7 +14,7 @@ GIL 不再共享；若吞吐随进程数接近线性、每请求 span 保持 ~6 
 
 用法::
 
-    .venv-linux/bin/python scripts/probes/pilot_concurrency_processes.py --seconds 4
+    .venv/bin/python scripts/probes/pilot_concurrency_processes.py --seconds 4
 """
 
 from __future__ import annotations

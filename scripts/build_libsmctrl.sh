@@ -96,5 +96,5 @@ echo "  库文件: $PREFIX/libsmctrl.so"
 echo
 echo "  在项目中启用:"
 echo "    export LIBSMCTRL_PATH=$PREFIX/libsmctrl.so"
-echo "  然后确认能力探针（本机驱动为 CUDA 13.x 时探针会明确报告不支持）:"
+echo "  然后确认能力探针（CUDA 13.x 必须使用回调路径，禁止 set_stream_mask）:"
 echo "    python scripts/probe_libsmctrl.py --config config.libsmctrl.example.yaml"

@@ -265,7 +265,7 @@ class RawLogger:
             "size": cell.size, "quota": cell.quota, "mode": cell.mode, "n": cell.n,
             "condition": cell.condition, "round": round_index, "inner_index": index,
             # wall_clock 是墙钟时刻。没有它就无法判断"慢样本"是均匀散布还是成簇出现——
-            # 而"成簇"是宿主机干扰的特征，"均匀"才是被测对象自身的性质。本课题已因缺少
+            # 而"成簇"可能表示外部资源干扰，"均匀"更可能是被测对象自身的性质。本课题已因缺少
             # 这个字段而无法分析一次 1296 样本实验的尾部结构。
             "wall_clock": time.time(),
             "exec_ms": exec_ms, "wall_ms": wall_ms, **clock,

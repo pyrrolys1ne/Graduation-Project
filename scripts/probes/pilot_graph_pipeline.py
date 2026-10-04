@@ -45,9 +45,8 @@ N=2 还有 303 req/s，**N=4 就挂死了**。二分结果（`/tmp` 一次性复
    若 `--replay 1` 已经饱和，说明瓶颈转移到了别处，需要重新定位。
 
 用法：
-    .venv-linux/bin/python scripts/probes/pilot_graph_pipeline.py --replay 1,2,4 --prep 2,4 --duration 6
+    .venv/bin/python scripts/probes/pilot_graph_pipeline.py --replay 1,2,4 --prep 2,4 --duration 6
 
-⚠️ 本脚本会独占 GPU。跑之前先确认宿主侧空闲。
 """
 
 from __future__ import annotations

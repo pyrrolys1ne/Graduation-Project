@@ -7,7 +7,7 @@
 
 ```bash
 export LIBSMCTRL_PATH=$HOME/.local/lib/libsmctrl/libsmctrl.so
-.venv-linux/bin/python scripts/probes/<script>.py
+.venv/bin/python scripts/probes/<script>.py
 ```
 
 原始 JSON 输出在 `results/reproducibility/probes/`（`results/` 已被 gitignore）。
@@ -57,8 +57,6 @@ export LIBSMCTRL_PATH=$HOME/.local/lib/libsmctrl/libsmctrl.so
 | `pilot_concurrency_span.py` | 无线程/流错配下 N 并发：现造 vs 预生成输入、发射耗时、功耗 | §22.2–22.3，机制指向主机侧发射 |
 | `pilot_concurrency_processes.py` | 同并发改线程为进程（不共享 GIL） | §22.3，进程下吞吐恒定 → 塌陷来自线程侧发射 |
 
-⚠️ 这两个 pilot 脚本会**独占 GPU**（各约 2 分钟），跑之前先确认宿主侧空闲。
-
 ### 第四轮：图回放流水线（对应 `docs/实验记录.md` §23）
 
 | 脚本 | 测什么 | 结论去向 |
@@ -86,6 +84,47 @@ export LIBSMCTRL_PATH=$HOME/.local/lib/libsmctrl/libsmctrl.so
 
 还有一条：**回放后的后处理（如算模长）必须在回放流内部做**。放到 `with torch.cuda.stream`
 之外会落到默认流，默认流的隐式同步语义足以让两个回放线程互等。
+
+### 第五轮：真 CLIP 的 S12/C66/C12 对照（2026-09-29 从 `/tmp` 抢救）
+
+这一组脚本此前**只在 `/tmp`**，`任务书.txt` 的 E1 读数由它们产生但**没有任何落盘产物**。
+2026-09-29 抢救入库，其中 `clip_stab2.py` 加了 `--out` 并重跑（测量逻辑未改）。
+
+| 脚本 | 测什么 | 产物 |
+|---|---|---|
+| `clip_stab2.py` | 672 / 1024 / 2048 的 S12 / S6 / C66 / C12，**每尺寸 8 次交替、逐次配对** | `results/reproducibility/probes/clip_stab2.json` |
+| `clip_arms.py` | 真 CLIP 三臂，尺寸 672 / 1024 | `clip_arms.json` |
+| `clip_arms2.py` | 真 CLIP 四臂（多 S6），尺寸 672–2048 六档，聚合口径 `2/max(t_a,t_b)` | `clip_arms2.json` |
+| `clip_stab.py` | `clip_stab2` 的前身 | 无（只 print） |
+| `big_sizes.csv` / `big_sizes2.csv` | 1024 / 1344 的配额曲线 | 同左 |
+
+⚠️ `clip_stab2` 与 `clip_arms2` 的**聚合口径不同**（逐次配对 vs `2/max`），
+两者的比值不可直接混用。`clip_stab2` 更严谨，**引用时以它为准**。
+
+### 第六轮：§10.2 的"计算受限"标签判定（2026-09-29）
+
+| 脚本 | 测什么 | 结论去向 |
+|---|---|---|
+| `diag_compute_bound_label.py` | 先标定**本卡 fp16 GEMM 持续峰值**（N=2048…8192 扫描，含 NVML 时钟/功耗/占用），再复刻 §10.2 三臂并算其占峰值百分比 | §10.2 的"计算受限"标签**成立**；顺带修正 §10.2 `per_job` 的 8× 单位错 |
+
+`kernels_probe.py` / `kernels_probe2.py` / `kernels_timing.py` / `host_share_big.py`
+为同期辅助探针（打印 kernel 名、事件计时、host 占比），无独立结论。
+
+### 第七轮：记录格式、分解与判决（2026-09-29）
+
+| 脚本 | 测什么 | 结论去向 |
+|---|---|---|
+| `diag_launch_vs_bubble.py` | 把"非 GPU 时间占比"分解为 跨度 / Σ内核 / 主机发射 / 气泡 | §37.2：**224 归因成立，672 不成立**；两臂内核集合完全相同 → 排除"图回放改变 GPU 执行" |
+| `diag_mask_in_graph_capture.py` | 掩码在**捕获时**施加能否烧进图（外加回放时的阴性对照） | §37.3：**三条挂载路径全部封死** |
+
+⚠️ **这两条约束都实测撞到，写脚本时必须遵守**：
+
+1. **一个尺寸一个进程**——同一进程内连捕两张 CUDA Graph 会挂死（与 §24.5 同类）。
+2. **`torch.profiler` 在同一进程内多次会话会挂死**——因此波动幅度只能从**跨进程重复**估。
+   `diag_launch_vs_bubble.py` 默认单次采样；判定函数在波动未知时拒绝下结论。
+
+⚠️ `diag_launch_vs_bubble.py` 的判定比的是**气泡 vs (主机发射 − Σ内核)**，不是 vs 主机发射
+总量——发射与 GPU 执行重叠，只有超出量才可能变成气泡。第一版比错了，已修。
 
 ## 纪律
 

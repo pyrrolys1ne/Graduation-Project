@@ -1,3 +1,8 @@
+runtime:
+  require_linux: true
+  require_cuda: true
+  min_python: [3, 10]
+  max_cuda_major: 13
 model:
   name: openai/clip-vit-base-patch32
   dtype: float16
@@ -6,6 +11,7 @@ scheduler:
   policy: edf_size
   deadline_tie_ms: 5.0
   quota_levels: [0.25, 0.5, 0.75, 1.0]
+  quota_policy: deadline_min
 executor:
   streams: 2
   resource_backend: libsmctrl

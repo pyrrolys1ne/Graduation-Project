@@ -17,7 +17,13 @@
 #   3. 与 batching 互斥——本版图不含批维。
 #
 # 用法：
-#   ENCODER_SCHED_CONFIG=config.graph.yaml .venv-linux/bin/python -m encoder_sched.api
+#   encoder-sched-server --config config.graph.yaml
+
+runtime:
+  require_linux: true
+  require_cuda: true
+  min_python: [3, 10]
+  max_cuda_major: 13
 
 model:
   name: openai/clip-vit-base-patch32
@@ -26,12 +32,13 @@ model:
 scheduler:
   policy: edf_size
   deadline_tie_ms: 5.0
-  quota_levels: [0.25, 0.5, 0.75, 1.0]
+  quota_levels: [1.0]
+  quota_policy: full
 executor:
   # 回放槽位按 slot_index 选流，因此流数必须 ≥ 槽位数。
   streams: 2
-  resource_backend: proxy
-  allow_proxy_fallback: true
+  resource_backend: none
+  allow_proxy_fallback: false
   libsmctrl_adapter: ""
   graph_pipeline: true
   graph:

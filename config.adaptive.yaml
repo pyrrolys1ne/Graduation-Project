@@ -7,12 +7,16 @@
 # 用法（注意必须导出 LIBSMCTRL_PATH，否则掩码不可用时启动会被拒绝）：
 #
 #   export LIBSMCTRL_PATH=$HOME/.local/lib/libsmctrl/libsmctrl.so
-#   ENCODER_SCHED_CONFIG=config.adaptive.yaml \
-#       .venv-linux/bin/python -m encoder_sched.api --port 8000
+#   encoder-sched-server --config config.adaptive.yaml --port 8000
 #
 # 对照实验不要直接跑这个文件——用 scripts/run_repeated_comparison.py --group concurrency，
 # 它会同时跑静态扫描（streams=1/2/3/4/6/8）与动态臂，并给逐轮配对差。
 
+runtime:
+  require_linux: true
+  require_cuda: true
+  min_python: [3, 10]
+  max_cuda_major: 13
 model:
   name: openai/clip-vit-base-patch32
   dtype: float16
@@ -20,11 +24,12 @@ model:
 scheduler:
   policy: multistream_fcfs
   deadline_tie_ms: 5.0
-  quota_levels: [0.25, 0.5, 0.75, 1.0]
+  quota_levels: [1.0]
+  quota_policy: full
 executor:
   streams: 2
-  resource_backend: proxy
-  allow_proxy_fallback: true
+  resource_backend: none
+  allow_proxy_fallback: false
   libsmctrl_adapter: ""
   adaptive_concurrency: true
   concurrency:

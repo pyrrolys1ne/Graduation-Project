@@ -1,0 +1,22 @@
+[Unit]
+Description=Multimodal encoder scheduling service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=encoder-sched
+Group=encoder-sched
+WorkingDirectory=/opt/encoder-sched
+EnvironmentFile=/etc/encoder-sched/encoder-sched.env
+ExecStartPre=/opt/encoder-sched/.venv/bin/encoder-sched-check --config ${ENCODER_SCHED_CONFIG}
+ExecStart=/opt/encoder-sched/.venv/bin/encoder-sched-server --config ${ENCODER_SCHED_CONFIG} --host ${ENCODER_SCHED_HOST} --port 8000
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=120
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

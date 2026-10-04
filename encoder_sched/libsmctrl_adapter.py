@@ -69,9 +69,9 @@ __all__ = [
 LIBRARY_PATH_ENV = "LIBSMCTRL_PATH"
 
 _LIBCUDA_CANDIDATES = (
-    "/usr/lib/wsl/lib/libcuda.so",
     "/usr/local/cuda/lib64/libcuda.so",
     "/usr/lib/x86_64-linux-gnu/libcuda.so",
+    "/usr/lib64/libcuda.so",
 )
 
 #: 回调路径所需的符号。缺失说明用的是未打补丁的上游库。
@@ -99,7 +99,7 @@ def _find_library(names: tuple[str, ...], explicit: str | None) -> str:
 
 
 def load_libcuda(explicit: str | None = None) -> ctypes.CDLL:
-    """加载 libcuda（WSL2 上位于 /usr/lib/wsl/lib/）。"""
+    """在原生 Linux 服务器上加载 NVIDIA driver API。"""
     names = (_LIBCUDA_CANDIDATES if explicit is None else (explicit,)) + ("cuda",)
     return ctypes.CDLL(_find_library(names, explicit))
 

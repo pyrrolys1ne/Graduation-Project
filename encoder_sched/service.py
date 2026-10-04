@@ -33,19 +33,25 @@ class EncoderService:
         encoder: EncoderBackend,
         metrics: MetricsStore,
         resource_backend: ResourceBackend | None = None,
+        sample_gpu: bool = True,
     ):
         self.config = config
         self.scheduler = scheduler
         self.encoder = encoder
         self.metrics = metrics
         self.resource_backend = resource_backend
+        self.runtime_report: dict[str, Any] | None = None
         self.queue: asyncio.PriorityQueue[tuple[tuple[float, ...], int, EncodeJob]] = asyncio.PriorityQueue()
         self.jobs: dict[str, EncodeJob] = {}
         self.futures: dict[str, asyncio.Future[EncodeJob]] = {}
         self._jobs_lock = threading.Lock()
         self._counter = itertools.count()
         self._workers: list[asyncio.Task[None]] = []
-        self.gpu_sampler = GpuUtilizationSampler(metrics, interval_s=config.metrics.gpu_sample_interval_s)
+        self.gpu_sampler = (
+            GpuUtilizationSampler(metrics, interval_s=config.metrics.gpu_sample_interval_s)
+            if sample_gpu
+            else None
+        )
         #: 运行时并发控制器。仅在 ``executor.adaptive_concurrency`` 打开时非 None，
         #: 否则并发度仍是启动时定死的 ``executor.streams``（历史行为，保持可复现）。
         self.controller: ConcurrencyController | None = None
@@ -105,7 +111,8 @@ class EncoderService:
         self._workers = [
             asyncio.create_task(coro(index), name=f"encoder-worker-{index}") for index in range(worker_count)
         ]
-        self.gpu_sampler.start()
+        if self.gpu_sampler is not None:
+            self.gpu_sampler.start()
 
     async def stop(self) -> None:
         await self.queue.join()
@@ -117,7 +124,8 @@ class EncoderService:
         await asyncio.gather(*self._preparers, return_exceptions=True)
         if self.graph is not None:
             self.graph.close()
-        self.gpu_sampler.stop()
+        if self.gpu_sampler is not None:
+            self.gpu_sampler.stop()
         output_dir = self.config.resolve(self.config.logging.output_dir)
         self.metrics.export_csv(output_dir / "requests.csv")
 
@@ -495,6 +503,7 @@ class EncoderService:
             "scheduler": self.scheduler.policy,
             "streams": len(self._workers),
             "environment": self.encoder.environment(),
+            "server_runtime": self.runtime_report,
             "resource": self.resource_backend.describe() if self.resource_backend else None,
             "graph_pipeline": self.graph.describe() if self.graph is not None else None,
         }

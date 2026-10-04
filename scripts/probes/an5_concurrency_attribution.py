@@ -14,7 +14,7 @@
 
 用法::
 
-    .venv-linux/bin/python scripts/probes/an5_concurrency_attribution.py \
+    .venv/bin/python scripts/probes/an5_concurrency_attribution.py \
         results/concurrency_openloop_2026-09-22
 """
 

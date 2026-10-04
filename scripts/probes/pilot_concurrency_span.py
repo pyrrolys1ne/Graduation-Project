@@ -18,7 +18,7 @@
 
 用法::
 
-    .venv-linux/bin/python scripts/probes/pilot_concurrency_span.py [--seconds 4]
+    .venv/bin/python scripts/probes/pilot_concurrency_span.py [--seconds 4]
 """
 
 from __future__ import annotations
@@ -64,9 +64,8 @@ def make_job(size: int, tag: str) -> EncodeJob:
 class PowerSampler:
     """运行期间采样功耗与利用率。
 
-    为什么必须看功耗：WSL 的 `nvidia-smi utilization.gpu` 在本项目里已被证明不可信
-    （§21 与 `an5`：Σexec/墙钟 = 6.9 时它报 25%）。功耗不会这样撒谎——
-    GPU 真在算就有几十瓦，只是空等就只有十几瓦。这正是区分
+    短 kernel 和多流并发下，单一利用率快照不足以还原整个测量区间。功耗与利用率
+    联合采样可用于区分
     「GPU 资源被争用」与「主机侧发射跟不上、GPU 在空转」的判别量。
     """
 

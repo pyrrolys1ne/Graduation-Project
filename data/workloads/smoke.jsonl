@@ -1,0 +1,12 @@
+{"arrival_ms": 33.943, "request_id": "mixed-20260902-00000", "seed": 20260902, "width": 224, "height": 224, "deadline_ms": 86.0, "priority": 0}
+{"arrival_ms": 68.348, "request_id": "mixed-20260902-00001", "seed": 20260903, "width": 336, "height": 336, "deadline_ms": 128.0, "priority": 0}
+{"arrival_ms": 104.224, "request_id": "mixed-20260902-00002", "seed": 20260904, "width": 448, "height": 448, "deadline_ms": 182.0, "priority": 0}
+{"arrival_ms": 156.16, "request_id": "mixed-20260902-00003", "seed": 20260905, "width": 672, "height": 672, "deadline_ms": 350.0, "priority": 1}
+{"arrival_ms": 178.331, "request_id": "mixed-20260902-00004", "seed": 20260906, "width": 224, "height": 224, "deadline_ms": 86.0, "priority": 1}
+{"arrival_ms": 202.336, "request_id": "mixed-20260902-00005", "seed": 20260907, "width": 336, "height": 336, "deadline_ms": 128.0, "priority": 1}
+{"arrival_ms": 240.001, "request_id": "mixed-20260902-00006", "seed": 20260908, "width": 448, "height": 448, "deadline_ms": 182.0, "priority": 0}
+{"arrival_ms": 252.687, "request_id": "mixed-20260902-00007", "seed": 20260909, "width": 672, "height": 672, "deadline_ms": 350.0, "priority": 0}
+{"arrival_ms": 267.641, "request_id": "mixed-20260902-00008", "seed": 20260910, "width": 224, "height": 224, "deadline_ms": 86.0, "priority": 0}
+{"arrival_ms": 268.982, "request_id": "mixed-20260902-00009", "seed": 20260911, "width": 336, "height": 336, "deadline_ms": 128.0, "priority": 0}
+{"arrival_ms": 322.772, "request_id": "mixed-20260902-00010", "seed": 20260912, "width": 448, "height": 448, "deadline_ms": 182.0, "priority": 0}
+{"arrival_ms": 332.48, "request_id": "mixed-20260902-00011", "seed": 20260913, "width": 672, "height": 672, "deadline_ms": 350.0, "priority": 1}

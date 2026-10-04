@@ -1,0 +1,400 @@
+==============================================================================
+多模态大模型推理中的编码器并发调度优化
+==============================================================================
+
+任务书
+
+课题中文名称：多模态大模型推理中的编码器并发调度优化
+课题英文名称：Optimization of Concurrent Encoder Scheduling in Multimodal Large Language Model Inference
+
+────────────────────────────────────────────────────────────────────────
+一、课题研究目标
+────────────────────────────────────────────────────────────────────────
+
+1.1 课题背景
+
+视觉语言模型（Vision-Language Model，VLM）和文本到语音模型（Text-to-Speech，TTS）都需要支持在线请求。与离线大任务相比，在线请求往往很短：输入图像可能只有224×224 至 672×672，语音回复通常只有几秒。单个请求的计算量有限，但又不能长时间等待组批，因此 GPU 可能出现空闲。
+
+当短请求连续到达时，系统仍然会形成较大的总负载。调度器可以让请求立即执行，也可以把已经在队列中的同类请求组成批次，或者把请求分给同一 GPU 上的多个执行副本。不同选择会影响吞吐率、平均延迟、尾延迟和 SLO 违约率，最合适的方式取决于请求规模和队列状态。
+
+本课题研究同一模型、同一 GPU 上独立小请求的并发推理，不改变模型结构和输出语义。主要问题是：如何确定适合并发的请求范围，以及如何在即时执行、零等待组批和多副本路由之间做选择。
+
+1.2 研究对象与应用场景
+
+本课题采用 VLM 与 TTS 两个场景，在统一的小请求并发推理问题下分别研究两类模型的执行机制与调度方法。
+
+（1）场景一：遥感小图的图文检索服务
+
+  · 请求形式：单张遥感 tile + 一条短文本，执行图像编码、文本编码和相似度检索；
+图库 embedding 离线预计算，在线路径不包含大规模索引构建。
+  · 主模型：`openai/clip-vit-base-patch32`（CLIP ViT-B/32）。
+  · 训练集：NWPU-Captions，31,500 张原生 256×256 图像、每图 5 条描述；使用
+train/val 做遥感域图文对比微调。
+  · 测试集：RSICD，10,921 张原生 224×224 图像、每图 5 条描述；作为独立的
+跨数据集检索与系统压力测试来源。
+  · 输入范围：以原生 224/256 为主，增加 336/448/672 的受控 processor input
+作为边界实验，最高不超过 1024；实验记录中区分原始分辨率和受控输入尺寸。
+  · 质量指标：image-to-text 和 text-to-image Recall@K、mean Recall（mR）。
+
+（2）场景二：中文语音助手/在线客服的一句话流式回复
+
+  · 请求形式：多个独立会话在上游语言模型产生一句回复后立即调用流式 TTS；收到首个
+可播放 PCM chunk 后开始播放。
+  · 主模型：`Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`。
+  · 数据集：AISHELL-3，约 85 小时、218 名说话人、88,035 条录音，平均约
+    3.48 秒/条。
+  · 请求范围：目标音频 1--10 秒，主分析区间 1--6 秒；以 12 Hz codec 计，
+分别约不超过 120 和 72 个 codec frame。
+  · 质量指标：CER/WER、speaker similarity，以及 UTMOS 或主观 MOS。
+
+1.3 “小请求”的操作性定义
+
+本课题不预先规定一个适用于所有模型的像素或字符阈值。小请求需要满足三个条件：单请求不能稳定占满 GPU；请求之间可以并发或组批而不改变结果；请求规模能够由在线可见特征近似表示。VLM 主要使用视觉 token、processor input 和文本 token，TTS 主要使用文本 token、预测音频时长和 codec frame 数。长视频、整幅高分辨率遥感影像和长篇语音生成不在本课题范围内。
+
+1.4 前期工作与方向调整
+
+前期工作已经完成了 CLIP ViT-B/32 的服务原型，包括请求队列、多流执行、批处理、CUDA Graph、资源后端和指标回放。初步观察显示，小图请求存在一定的 GPU 空闲；共享多流和零等待组批比固定空间分区更值得继续比较；复杂的窗口评分调度器会增加规划和排队开销。
+
+这些结果用于确定研究问题，正式实验将在 A100 服务器上重新标定。
+
+1.5 拟解决的主要问题
+
+（1）怎样确定小请求的并发边界。分别沿 VLM 的视觉 token 和 TTS 的输出时长测量执行
+时间、GPU 活跃度、显存和并发收益，得到与模型、设备和 SLO 相关的边界。
+
+（2）即时并发、零等待组批和多副本路由在什么负载下更合适。重点考察请求规模、到达
+强度、shape 兼容性和剩余 SLO 时间的影响。
+
+（3）动态选择是否值得。将规模和 SLO 感知的策略与每种负载下扫描得到的最佳静态配置
+比较，判断动态决策能否带来稳定收益。
+
+（4）上述规律能否在 VLM 和 TTS 两种场景中同时观察到，并明确两者在首包延迟、状态和
+显存占用方面的差异。
+
+1.6 预期目标
+
+  1. 建立一套多模态小请求的判定方法，说明请求规模、单请求利用率、并发收益和 SLO
+之间的关系。
+  2. 实现规模与 SLO 感知的并发编排策略：在 VLM 场景中动态选择即时多流、零等待
+组批和保守串行路径；在 TTS 场景中实现长度感知的 replica 路由。
+  3. 在欠饱和、接近容量、突发和持续过载负载下，与最佳静态基线进行至少 5 次重复对照，
+同时报告吞吐率、平均延迟、P99、GPU 利用率和 SLO 违约率。
+  4. 保证系统优化不改变模型任务质量：VLM 报告 Recall@K/mR，TTS 报告 CER/WER、
+speaker similarity 和语音质量指标。
+  5. 说明方法的适用范围、失效条件和可能的负结果。
+
+1.7 研究边界
+
+纳入范围：
+
+  · 单 GPU、同一模型的独立在线小请求；
+  · VLM 单图 + 短文本，processor input 以 224--672 为主，最高不超过 1024；
+  · TTS 一句话流式回复，目标音频 1--10 秒，以 1--6 秒为主；
+  · 请求级并发、零等待动态组批、CUDA Graph 和 same-GPU 多副本；
+  · 吞吐、平均/P99 延迟、GPU 利用率、SLO 违约率以及任务质量。
+
+不纳入范围：
+
+  · 长视频、长文档、多页文档、整幅遥感影像和长篇语音生成；
+  · 多卡集群调度、跨节点通信、模型并行和容错；
+  · 修改模型结构、剪枝、蒸馏或以降低质量换取性能；
+  · 把动态 SM/TPC 配额作为主要创新；
+  · 把完整 7B 级 VLM 的语言模型 decode 优化混入 VLM 视觉编码实验。
+
+1.8 预期成果
+
+  1. 一套可运行的多模态小请求并发推理原型，包括 VLM 与 TTS 两类服务路径、开放环
+负载生成、在线调度和指标采集。
+  2. 一套请求规模与并发收益的剖析数据，覆盖 VLM 图像尺寸/视觉 token 和 TTS 音频
+时长/codec frame 两类轴。
+  3. 一种规模与 SLO 感知的低开销并发编排策略及完整消融实验。
+  4. VLM 与 TTS 两个具体场景的基线、质量护栏和重复实验结果。
+  5. 可复现材料：代码、配置、工作负载、原始样本、统计脚本、环境说明和毕业论文。
+
+────────────────────────────────────────────────────────────────────────
+二、课题研究方法
+────────────────────────────────────────────────────────────────────────
+
+2.1 总体技术路线
+
+研究分为四步：先用真实数据提取请求特征并测量单请求性能；再比较串行、多流、组批和多副本等静态配置；随后根据测得的服务时间和队列状态实现动态选择；最后在开放环负载下进行重复实验，并结合任务质量指标分析适用范围。
+
+VLM 使用 NWPU-Captions、RSICD 和合成到达轨迹，TTS 使用 AISHELL-3 和独立构造的到达轨迹。两类场景分别记录服务时间、TTFA、GPU 利用率、显存、并发收益和预测误差。
+
+2.2 工作负载构造
+
+（1）VLM 工作负载
+
+训练阶段使用 NWPU-Captions 官方划分，对 CLIP 做图文对比微调；正式系统测试使用RSICD，避免训练测试混用。每个在线请求包含图像、短文本、到达时刻和 deadline。图库向量预先生成，使在线路径集中在多模态 query 编码和相似度查询。
+
+系统负载包含四类：
+
+  · 固定 224/256 小图，用于最干净地测量小请求并发；
+  · 224/336/448/672 混合输入，用于检验规模异构；
+  · 泊松到达，用于稳态容量和排队分析；
+  · 微突发与持续过载，用于 P99 和 SLO 违约分析。
+
+（2）TTS 工作负载
+
+从 AISHELL-3 提取文本、speaker 和真实音频时长，按 1--3 秒、3--6 秒和 6--10 秒分层采样。固定音色作为主实验，避免多说话人切换和参考音频编码成为混杂因素。到达过程同时包含泊松、会话突发和持续过载。开放环发送器不因前一个请求未完成而推迟下一个请求，防止客户端连接池把服务端吞吐钉死。
+
+2.3 性能刻画与“小请求”边界
+
+对每个模型和输入桶测量单请求执行时间、GPU 活跃度、显存、CPU 利用率、kernel 发射间隙，以及不同 batch size、stream 数和 replica 数下的吞吐和延迟。并发收益定义为
+
+G(a, b) = Throughput(a, b) / Throughput(serial, 1)
+
+其中 a 表示执行方式，b 表示 batch size、stream 数或 replica 数。结合重复实验的结果，在吞吐有所提升且 P99、TTFA 和 SLO 仍满足要求时，将该输入桶划入适合并发的范围。
+
+2.4 规模与 SLO 感知的并发编排策略
+
+调度器只使用请求到达时能够取得的特征和离线测得的性能表。VLM 使用视觉 token、文本token 和 shape bucket，TTS 使用文本 token、预测音频时长和 codec frame。对每种执行方式估计完成时间，并根据
+
+slack(r, a) = deadline(r) - now - T_hat(r, a)
+
+判断是否还能等待。只有队列中已有兼容请求时才组批，默认不为组批额外等待；若等待会使SLO 余量不足，则直接选择可用的 lane 或 replica。
+
+在满足 SLO 的候选中，优先选择预测完成时间较短的执行方式，同时记录预测误差。样本超出性能表范围或预测不可靠时，回退到预先扫描得到的静态配置。调度开销控制在最小请求执行时间的 5% 以内。
+
+VLM 比较立即执行、共享多流和已有同 shape 请求的零等待 batch，CUDA Graph 作为可选执行后端；TTS 比较单 replica batching、双 replica 以及双 replica + CUDA MPS，并加入长度和队列感知的路由。
+
+2.5 VLM 系统实现
+
+在现有原型上接入 RSICD 和 NWPU-Captions 的真实图像、文本预处理以及 CLIPProcessor。保留串行、共享多流和零等待组批三条执行路径，在固定 shape 和 batch 档位上测试 CUDA Graph。系统同时记录服务端排队与执行时间、客户端端到端时间，并保存在线决策和原始请求数据。主实验使用同一 CLIP ViT-B/32 权重；RemoteCLIP 可作为质量对照，LLaVA-
+1.5-336 只用于后期的视觉编码器泛化测试。
+
+2.6 TTS 系统实现
+
+先在目标 GPU 上建立 Qwen3-TTS 0.6B 单 replica 基线，测量显存、TTFA、RTF、吞吐和GPU 利用率。随后依次比较单 replica、单 replica 原生 batching、双 replica（无 MPS）和双 replica + CUDA MPS，并在可行配置上加入长度和队列感知的路由。
+
+2.7 基线与消融
+
+VLM 基线：
+
+  B1  串行 FCFS，batch=1；
+  B2  固定两条共享 CUDA Stream；
+  B3  固定最大 batch 的零等待动态组批；
+  B4  runtime 可用时的 CUDA Graph 固定档位；
+  B5  对每种负载离线扫描得到的最佳静态配置；
+  M   本课题的规模与 SLO 感知动态编排。
+
+TTS 基线：
+
+  T1  单 replica；
+  T2  单 replica + native batching；
+  T3  DP2，无 MPS；
+  T4  DP2 + MPS + round-robin/least-queue 路由；
+  M   DP2 + MPS + 长度/SLO/预测完成时间感知路由。
+
+消融实验分别去掉规模预测、SLO 判断、预测误差项和零等待约束。动态策略与每种负载下的最佳静态配置或标准路由比较。
+
+2.8 评价指标
+
+所有正式实验至少报告：
+
+  · 吞吐率：VLM 为 req/s，TTS 同时报 req/s 与 audio_s/s；
+  · 平均、P95、P99 服务端完成时间；
+  · 客户端端到端平均/P99，VLM 与服务端口径分列；
+  · TTS 平均/P95/P99 TTFA 与 real-time factor（RTF）；
+  · GPU utilization/SM Active、显存、功耗和 CPU 利用率；
+  · 完成时间 SLO 违约率，TTS 另报 TTFA SLO 违约率；
+  · 排队延迟、调度开销、失败率和拒绝率；
+  · VLM Recall@K/mR；TTS CER/WER、speaker similarity、UTMOS/MOS。
+
+TTS 第一阶段可暂设 TTFA <= 200 ms、1--6 秒请求 RTF <= 1，但必须按目标设备的单replica 分布重新校准。VLM SLO 由单请求基线和应用目标分成宽松、普通、紧三档，不使用任意固定常数跨设备比较。
+
+2.9 实验纪律与统计方法
+
+实验采用开放环到达，覆盖欠饱和、接近容量、突发和持续过载四类负载。每个正式配置至少重复 5 次，交替运行各实验臂，报告均值、标准差和逐轮差异。逐请求原始数据包括到达、入队、开始、首包和完成时间。比较时保持模型、精度、数据、SLO、CPU、显存预算和到达率一致；同时记录异常运行，不把服务端和客户端的延迟口径混在一起。
+
+2.10 可行性与风险
+
+VLM 原型和 CLIP 权重已经具备，主要工作是接入真实数据和完成调度实验。TTS 需要先做硬件和显存预检；如果 DP2 或 MPS 无法稳定运行，则把 TTS 研究收缩为单副本边界验证，不以模拟结果替代真实对照。
+
+如果动态策略在三类以上负载、至少 5 次重复中都不能稳定改善吞吐、P99 或 TTFA，就保留静态配置边界和负结果，不继续增加在线策略复杂度。若单请求已经占满 GPU，则将结论限于实际测得的小模型和短请求范围。组批默认不额外等待；如果零等待组批明显损害 P99 或 SLO，则关闭该路径。模型质量变化单独检查，不与并发收益混合分析。
+
+────────────────────────────────────────────────────────────────────────
+三、文献综述
+────────────────────────────────────────────────────────────────────────
+
+3.1 多模态推理服务
+
+DistServe、Splitwise、HydraInfer、ElasticMM、EPDServe 和 SpaceServe 等工作说明，多模态服务可以按视觉编码、预填充和解码等阶段进行拆分。现有研究更多关注阶段间协同、跨设备部署或高分辨率和多图输入，对同一模型中短小视觉请求的并发执行方式讨论较少。
+
+本课题先使用 CLIP 双塔检索，把视觉编码路径从完整语言模型推理中分离出来，再视条件加入生成式 VLM 的视觉编码器作为泛化对照。
+
+3.2 GPU 并发、组批与资源共享
+
+Nexus、Clockwork 和 Triton 的工作表明，批处理和调度需要在吞吐与排队延迟之间取舍；FineST、Bless、SGDRC、Bullet 和 ZipBatch 则研究了 GPU 共享、空间分区以及资源控制。这些方法为本课题提供基线，但不能直接说明短请求应当采用哪种执行方式。本课题将串行、共享多流和组批作为主要对照，空间分区只作补充实验。
+
+CUDA Graph 适合固定 shape 的短路径，可以减少 kernel 发射开销，但会受到 shape、batch size 和显存限制。本课题将其作为执行后端单独评价。
+
+3.3 TTS 流式服务与 same-GPU MPS DP
+
+流式 TTS 除完整请求时间外，还需要关注 time-to-first-audio。SGLang Omni 已提供同一 GPU上的多副本和 CUDA MPS 实现，可作为本课题的基线。该方案受到模型显存、CPU 资源和平台稳定性的影响，因此实验中同时记录启动和运行失败。Qwen3-TTS 0.6B 与 AISHELL-3 为中文一句话回复提供了可复现的模型和数据。
+
+3.4 数据集与模型选择
+
+CLIP 使用图文对比学习得到统一 embedding，适合把视觉和文本编码作为在线多模态请求，同时避免自回归语言解码成为主要瓶颈。RSICD 的 10,921 张图固定为 224×224，NWPU- Captions 的 31,500 张图固定为 256×256，两者都提供每图 5 条描述，能够在不依赖动态切片的情况下构造真实小图请求。
+
+NWPU-Captions 规模更大，适合遥感域微调；RSICD 作为不同来源的独立测试集，可以检查检索质量和系统结论是否只依赖训练集。NWPU-RESISC45 底图许可与 caption 标注仓库许可并不完全相同，正式发布衍生物前需要再次核查。
+
+AISHELL-3 平均音频长度约 3.48 秒，天然落在一句话回复的主分析区间。它是录音棚朗读数据，不代表客服业务的到达过程，因此只用于文本、真实时长和质量评价；服务负载需要独立构造。
+
+3.5 本课题定位
+
+本课题关注这样一类服务：单请求工作量较小，深度组批又会增加等待时间。研究将以遥感小图检索为主，以中文一句话 TTS 作对照，测量请求规模、队列状态和 SLO 对执行方式选择的影响。预期形成小请求的实测边界、并发方式的系统比较，以及在动态策略无明显收益时的负结果和适用范围。
+
+3.6 主要参考文献
+
+[1] Alec Radford, Jong Wook Kim, Chris Hallacy, et al. Learning Transferable
+Visual Models From Natural Language Supervision. ICML 2021, PMLR 139, pp. 8748--8763.
+
+[2] Xiaoqiang Lu, Binqiang Wang, Xiangtao Zheng, Xuelong Li. Exploring Models
+and Data for Remote Sensing Image Caption Generation. IEEE Transactions on Geoscience and Remote Sensing, 56(4):2183--2195, 2018.
+
+[3] Qimin Cheng, Haiyan Huang, Yuan Xu, et al. NWPU-Captions Dataset and
+MLCA-Net for Remote Sensing Image Captioning. IEEE Transactions on Geoscience and Remote Sensing, Vol. 60, pp. 1--19, 2022.
+
+[4] Haotian Liu, Chunyuan Li, Qingyang Wu, Yong Jae Lee. Visual Instruction
+Tuning. NeurIPS 2023.
+
+[5] Jinze Bai, Shuai Bai, Shusheng Yang, et al. Qwen-VL: A Versatile
+Vision-Language Model for Understanding, Localization, Text Reading, and Beyond. arXiv:2308.12966, 2023.
+
+[6] Pratyush Patel, Esha Choukse, Chaojie Zhang, et al. Splitwise: Efficient
+Generative LLM Inference Using Phase Splitting. ISCA 2024, pp. 118--132.
+
+[7] Yinmin Zhong, Shengyu Liu, Junda Chen, et al. DistServe: Disaggregating
+Prefill and Decoding for Goodput-optimized Large Language Model Serving. OSDI 2024, pp. 193--210.
+
+[8] Xianzhe Dong, Tongxuan Liu, Yuting Zeng, et al. HydraInfer: Hybrid
+Disaggregated Scheduling for Multimodal Large Language Model Serving. arXiv:2505.12658, 2025.
+
+[9] Zedong Liu, Shenggan Cheng, Guangming Tan, et al. ElasticMM: Efficient
+Multimodal LLMs Serving with Elastic Multimodal Parallelism. NeurIPS 2025.
+
+[10] Gursimran Singh, Xinglu Wang, Ivan Hu, et al. Efficiently Serving Large
+Multimodal Models Using EPD Disaggregation. ICML 2025, PMLR 267, pp. 55740--55756.
+
+[11] Zhicheng Li, Shuoming Zhang, Jiacheng Zhao, et al. SpaceServe: Spatial
+Multiplexing of Complementary Encoders and Decoders for Multimodal LLMs. NeurIPS 2025.
+
+[12] Haichen Shen, Lequn Chen, Yuchen Jin, et al. Nexus: A GPU Cluster Engine
+for Accelerating DNN-Based Video Analysis. SOSP 2019, pp. 322--337.
+
+[13] Arpan Gujarati, Reza Karimi, Safya Alzayat, et al. Serving DNNs like
+Clockwork: Performance Predictability from the Bottom Up. OSDI 2020, pp. 443--462.
+
+[14] Weihao Cui, Han Zhao, Quan Chen, et al. Enable Simultaneous DNN Services
+Based on Deterministic Operator Overlap and Precise Latency Prediction. SC 2021.
+
+[15] Yaqiong Peng, Weiguo Gao, Haocheng Peng. Serving DNN Inference With
+Fine-Grained Spatio-Temporal Sharing of GPU Servers. IEEE Transactions on Services Computing, 17:4310--4323, 2024.
+
+[16] Shulai Zhang, Quan Chen, Weihao Cui, et al. Improving GPU Sharing
+Performance through Adaptive Bubbleless Spatial-Temporal Sharing. EuroSys 2025, pp. 573--588.
+
+[17] Yongkang Zhang, Haoxuan Yu, Chenxia Han, et al. SGDRC: Software-Defined
+Dynamic Resource Control for Concurrent DNN Inference on NVIDIA GPUs. PPoPP 2025.
+
+[18] Zejia Lin, Hongxin Xu, Guanyi Chen, et al. Boosting LLM Serving through
+Spatial-Temporal GPU Resource Sharing. ASPLOS 2026. arXiv:2504.19516.
+
+[19] Haoxuan Yu, Sheng Yao, Wei Wang. ZipBatch. ACM Symposium on Cloud
+Computing (SoCC 2025). DOI: 10.1145/3772052.3772229.
+
+[20] Joshua Bakita, James H. Anderson. Hardware Compute Partitioning on NVIDIA
+GPUs for Composable Systems. ECRTS 2025.
+
+[21] Hangrui Hu, Xinfa Zhu, Ting He, et al. Qwen3-TTS Technical Report.
+arXiv:2601.15621, 2026.
+
+[22] Yao Shi, Hui Bu, Xin Xu, Shaoji Zhang, Ming Li. AISHELL-3: A Multi-speaker
+Mandarin TTS Corpus and the Baselines. arXiv:2010.11567, 2020.
+
+[23] Philip Anastassiou, Jiawei Chen, Jitong Chen, et al. Seed-TTS: A Family
+of High-Quality Versatile Speech Generation Models. arXiv:2406.02430, 2024.
+
+[24] SGLang Omni. Same-GPU Data Parallelism with CUDA MPS; Qwen3-TTS Cookbook.
+https://sgl-project.github.io/sglang-omni/, accessed 2026-09-29.
+
+[25] NVIDIA. CUDA Multi-Process Service Documentation.
+https://docs.nvidia.com/deploy/mps/, accessed 2026-09-29.
+
+[26] NVIDIA. Triton Inference Server: Dynamic Batching Documentation.
+https://docs.nvidia.com/deeplearning/triton-inference-server/, accessed 2026-09-29.
+
+────────────────────────────────────────────────────────────────────────
+四、工作计划与时间安排
+────────────────────────────────────────────────────────────────────────
+
+总体安排：2026 年 10 月至 2027 年 2 月完成研究与论文初稿，2027 年 3 月起准备答辩。
+
+阶段一：2026.10.01 -- 10.20，研究范围与数据准备
+
+  · 完成开题答辩，并根据意见确定小请求定义、两个场景和评价口径；
+  · 下载并审计 NWPU-Captions、RSICD 和 AISHELL-3；
+  · 补齐 CLIPProcessor/tokenizer，核验图像文件、caption 和划分；
+  · 固化服务器 GPU 型号、驱动、PyTorch CUDA runtime、显存、CPU core 和 MPS 状态；
+  · 统一随机种子、原始样本格式和运行环境检查方法。
+
+产出：开题答辩材料、数据审计报告、实验安排和运行手册。
+
+阶段二：2026.10.21 -- 11.15，VLM 真实数据接入与质量基线
+
+  · 完成 CLIP 图文在线请求路径；
+  · 在 NWPU-Captions 上微调并在 RSICD 上验证 Recall@K/mR；
+  · 建立 224/256/336/448/672 各桶的单请求性能与质量基线；
+  · 复测串行、共享多流、零等待组批和 CUDA Graph。
+
+产出：VLM 质量模型、真实负载、静态配置扫描和小请求边界初稿。
+
+阶段三：2026.11.16 -- 12.10，动态编排策略实现
+
+  · 实现请求规模预测、SLO 判断、动作完成时间预测和回退机制；
+  · 完成 VLM 在线编排与四项消融；
+  · 保证调度开销不超过最小请求执行时间的 5%；
+  · 增加单元、集成和回放测试。
+
+产出：VLM 动态编排器、测试、初步消融结果。
+
+阶段四：2026.12.11 -- 2027.01.05，TTS 可行性检查与系统接入
+
+  · 部署 Qwen3-TTS 0.6B 单 replica，测显存、TTFA、RTF、吞吐平台与 GPU 利用率；
+  · 判断目标设备能否启动 DP2，并核实原生 Linux CUDA MPS 环境；
+  · 完成 AISHELL-3 分层 trace、单 replica/native batching 基线；
+  · 条件满足时完成 DP2 无 MPS、DP2 + MPS 和路由器接入。
+
+产出：TTS 可行性报告、基线数据和可运行路由器。若当前服务器无法稳定运行 DP2，则换用
+更大显存节点，或把 TTS 研究限定为单副本边界验证。
+
+阶段五：2027.01.06 -- 01.25，正式重复实验
+
+  · VLM：四类负载 × 六个基线/方法 × 至少 5 次重复；
+  · TTS：三种长度桶和混合负载 × 可行基线/方法 × 至少 5 次重复；
+  · 报告吞吐、平均/P99、GPU 利用率、SLO 违约率和质量指标；
+  · 完成逐轮配对、置信区间、异常运行和预测误差分析。
+
+产出：完整原始数据、统计表、论文图表。
+
+阶段六：2027.01.26 -- 02.10，边界验证与结果收敛
+
+  · 验证更紧 SLO、更强突发、混合请求规模和目标范围边界；
+  · 检查动态策略是否真正优于最佳静态配置；
+  · 比较 VLM 与 TTS 的共同规律和差异；
+  · 根据实验结果删去没有效果的机制，整理负结果和局限。
+
+产出：最终实验结论、适用范围、失效条件和复现材料。
+
+阶段七：2027.02.11 -- 02.28，论文撰写与修改
+
+  · 完成论文初稿、系统设计图、实验章节和相关工作；
+  · 明确区分前期观察、正式实验结论和未验证推断；
+  · 根据导师意见修改并提交论文。
+
+产出：论文初稿、修改稿、提交版。
+
+答辩阶段：2027.03 起
+
+完成答辩材料、演示系统、数据归档和最终论文。

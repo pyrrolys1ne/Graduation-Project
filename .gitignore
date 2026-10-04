@@ -4,18 +4,17 @@ __pycache__/
 .pytest-tmp/
 *.py[cod]
 results/
-data/workloads/
 .coverage
 htmlcov/
+slurm/cluster.env
+slurm/logs/
+slurm-*.out
+slurm-*.err
 
 # 文献管理文件
-docs/
 literature/
 *.egg-info/
 .claude/
 
-# 本地协作、毕设过程与文献管理文件（不纳入公开仓库）
-AGENTS.md
-任务书.txt
+# 本地文献管理工具
 inspect_zotero.py
-.agents/

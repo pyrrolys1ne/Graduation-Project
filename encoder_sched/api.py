@@ -17,6 +17,7 @@ from .metrics import MetricsStore
 from .models import EncodeJob
 from .performance import PerformanceModel
 from .resource import create_resource_backend
+from .runtime import validate_server_runtime
 from .scheduler import Scheduler
 from .service import DuplicateRequestError, EncoderService, JobNotFoundError
 
@@ -24,8 +25,8 @@ from .service import DuplicateRequestError, EncoderService, JobNotFoundError
 class EncodeRequest(BaseModel):
     request_id: str = Field(min_length=1, max_length=128)
     seed: int = Field(default=0, ge=0)
-    width: int = Field(default=224, ge=64, le=672)
-    height: int = Field(default=224, ge=64, le=672)
+    width: int = Field(default=224, ge=64, le=1024)
+    height: int = Field(default=224, ge=64, le=1024)
     deadline_ms: float = Field(default=1000, gt=0, le=120_000)
     priority: int = Field(default=0, ge=-100, le=100)
 
@@ -71,11 +72,12 @@ def _ensure_libsmctrl_target(config: AppConfig, fake: bool) -> None:
     if fake:
         raise ValueError(
             "resource_backend=libsmctrl 不能与 FakeEncoder 同用：FakeEncoder 传的是 worker id，"
-            "不是 CUDA stream 句柄。如需验证软件链路，请显式改用 resource_backend=proxy。"
+            "不是 CUDA stream 句柄。如需验证软件链路，请显式改用 resource_backend=none。"
         )
 
 
 def build_service(config: AppConfig, fake: bool = False) -> EncoderService:
+    runtime_report = None if fake else validate_server_runtime(config)
     performance = PerformanceModel(config.resolve(config.profiling.table_path))
     dacc_config = DaccConfig(
         window=config.scheduler.dacc_window,
@@ -122,7 +124,9 @@ def build_service(config: AppConfig, fake: bool = False) -> EncoderService:
     )
     log_dir = config.resolve(config.logging.output_dir)
     metrics = MetricsStore(log_dir / config.logging.request_log)
-    return EncoderService(config, scheduler, encoder, metrics, resource)
+    service = EncoderService(config, scheduler, encoder, metrics, resource, sample_gpu=not fake)
+    service.runtime_report = runtime_report
+    return service
 
 
 def create_app(config_path: str | Path | None = None, fake: bool | None = None) -> FastAPI:
@@ -182,10 +186,12 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="启动编码器调度服务")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--config", default=os.getenv("ENCODER_SCHED_CONFIG", "config.yaml"))
+    parser.add_argument("--host", default=os.getenv("ENCODER_SCHED_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--log-level", default="info")
     args = parser.parse_args()
-    uvicorn.run("encoder_sched.api:app", host=args.host, port=args.port, reload=False)
+    uvicorn.run(create_app(args.config), host=args.host, port=args.port, log_level=args.log_level)
 
 
 if __name__ == "__main__":

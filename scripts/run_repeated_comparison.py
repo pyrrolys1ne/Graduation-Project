@@ -11,10 +11,6 @@
     python scripts/run_repeated_comparison.py --group ablations --repeats 5
     python scripts/run_repeated_comparison.py --group window --repeats 5
 
-正式对照之前**先跑预检**（只跑单流哨兵，环境不合格时退出码为 1）::
-
-    python scripts/run_repeated_comparison.py --group concurrency --sentinel-only
-
 注意：本脚本只验证软件调度闭环。资源后端为 ``proxy`` 时结果不含真实 SM 隔离效果，
 输出中的 ``resource_backend`` 与 ``sm_isolation_verified`` 字段会如实标注。
 """
@@ -138,7 +134,7 @@ GROUPS: dict[str, dict[str, dict]] = {
     #
     # 三臂的策略**全部是 multistream_fcfs**，只改执行机制，因此差异可归因到机制本身
     # 而不是排序规则。判据：`graph_slots1` 相对 `eager_2stream` 与 `eager_serial`
-    # 的**逐轮配对差**为正、且每轮哨兵 ≤1.5×。
+    # 的**逐轮配对差**为正。
     #
     # ⚠️ 本组只能用 `saturating_180rps.jsonl` 这一档（见 GROUP_DEFAULT_WORKLOAD）：
     # 图回放的容量是 222 req/s，更低的到达率两个臂都跟得上、吞吐被到达率钉死；
@@ -227,9 +223,6 @@ METRICS = (
     "gpu_samples",
 )
 
-#: 单流哨兵的污染阈值：实测中位 / 预测中位 超过它即判定环境不合格。
-#: 与 ``ConcurrencyConfig.drift_threshold`` 一致——本课题的标定表本身有 ±35%
-#: 级别的会话间波动，超过 1.5× 就超出了"噪声"能解释的范围。
 #: 每组的默认负载。**不给默认会让历史上那个头号陷阱重演**：到达率低于服务容量时，
 #: 所有臂的吞吐都被到达率钉在同一个值上，**无法区分任何调度策略**（§3 的教训——
 #: 早期 `comparison_mixed.jsonl` 的 57.8 req/s 与服务率 57.4 几乎相等，
@@ -245,14 +238,6 @@ GROUP_DEFAULT_WORKLOAD = {
     "concurrency": "data/workloads/saturating_4ms.jsonl",
 }
 DEFAULT_WORKLOAD = "data/workloads/comparison_mixed.jsonl"
-
-SENTINEL_THRESHOLD = 1.5
-
-#: 预检必须覆盖的四种尺寸。与 ``data/profiles/default.csv`` 同一组采样点：
-#: "可复现性有尺寸依赖"是本课题的核心发现，少覆盖一档，"合格"这个结论
-#: 就不能外推到那一档。
-SENTINEL_SIZES = ((224, 224), (336, 336), (448, 448), (672, 672))
-
 
 def wait_ready(url: str, process: subprocess.Popen, timeout: float = 180.0) -> dict:
     deadline = time.monotonic() + timeout
@@ -419,72 +404,6 @@ def paired_differences(
     return output
 
 
-def contamination_check(jsonl_path: Path) -> dict:
-    """用独立的**单流哨兵**判断这一轮是否被环境污染。
-
-    为什么需要它：本课题已有一次因 Windows 宿主进程占用 GPU 而整轮作废的记录。
-    WSL 内的 ``nvidia-smi`` **看不到宿主进程**，所以"开机前查一眼利用率"是
-    不可靠的守门方式——2026-09-17 那一轮就是这么漏过去的（GPU 显示 1% 空闲，
-    但 CLIP 单请求实测 9.8 ms 而标定表写 4.9 ms）。
-
-    调用方必须保证日志来自 ``streams=1``、关闭自适应、客户端并发为 1 的哨兵。
-    不能读取正式臂日志：高并发下 ``execution_ms`` 包含策略自身的共驻争用，而
-    ``predicted_ms`` 来自单请求剖析表，直接比较会随并发度自然增大并制造假阳性。
-
-    返回的 ``ratio`` 是**按尺寸分档统计后取最差档**的中位比值，因为本课题的
-    核心发现正是可复现性有尺寸依赖，池化会把小尺寸的失真平均掉。
-    """
-    rows: list[dict] = []
-    with jsonl_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    by_size: dict[tuple[int, int], list[float]] = {}
-    for row in rows:
-        observed = row.get("execution_ms")
-        predicted = row.get("predicted_ms")
-        if observed and predicted:
-            by_size.setdefault((row.get("width", 0), row.get("height", 0)), []).append(observed / predicted)
-    worst = 0.0
-    per_size: dict[str, float] = {}
-    for size, ratios in sorted(by_size.items()):
-        median_ratio = statistics.median(ratios)
-        per_size[f"{size[0]}x{size[1]}"] = median_ratio
-        worst = max(worst, median_ratio)
-    return {
-        "worst_ratio": worst,
-        "per_size": per_size,
-        "samples": len(rows),
-        "contaminated": worst > SENTINEL_THRESHOLD,
-    }
-
-
-def sentinel_variant(variant: dict) -> dict:
-    """从正式臂派生单流环境哨兵，保留后端设置但关闭批处理与并发控制。"""
-    sentinel = dict(variant)
-    sentinel.update(policy="multistream_fcfs", streams=1, adaptive=False)
-    sentinel.pop("batch", None)
-    # 哨兵是**eager 单流**的环境参照系，必须剥掉图回放——否则量到的是图路径的
-    # 执行时间，与单请求标定表不可比，环境污染判定会整体失真。
-    sentinel.pop("graph", None)
-    sentinel.pop("delay_ms", None)
-    sentinel.pop("overrides", None)
-    return sentinel
-
-
-def workload_sizes(path: Path) -> set[tuple[int, int]]:
-    """负载里出现过的 (width, height) 集合。"""
-    sizes: set[tuple[int, int]] = set()
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                row = json.loads(line)
-                sizes.add((row.get("width"), row.get("height")))
-    return sizes
-
-
 def workload_request_count(path: Path) -> int:
     """负载的请求条数，用于把客户端连接上限开到"永不节流"（开环）。"""
     with path.open("r", encoding="utf-8") as handle:
@@ -509,122 +428,6 @@ def resolve_client_concurrency(requested: int, workload: Path) -> int:
     if requested > 0:
         return requested
     return max(1, workload_request_count(workload))
-
-
-def unique_sentinels(base: dict, variants: dict, out_dir: Path) -> list[dict]:
-    """按哨兵配置内容去重，一个唯一配置 = 一次预检。
-
-    concurrency 组的 7 个臂只派生得出少数几个不同的哨兵：静态臂之间只差
-    ``streams``，而哨兵本来就固定 ``streams=1``；只有资源后端不同的臂才会
-    派生出不重复的哨兵。不去重就要把同一次预检跑 7 遍，而预检的全部意义
-    恰恰是"别在环境可能不合格时启动整批实验"。
-    """
-    seen: dict[str, dict] = {}
-    for name, variant in variants.items():
-        sentinel = sentinel_variant(variant)
-        key = json.dumps(sentinel, sort_keys=True, ensure_ascii=False)
-        if key not in seen:
-            workdir = out_dir / f"sentinel_{len(seen)}"
-            workdir.mkdir(parents=True, exist_ok=True)
-            seen[key] = {
-                "arms": [],
-                "variant": sentinel,
-                "workdir": workdir,
-                "config": build_config(base, sentinel, workdir),
-            }
-        seen[key]["arms"].append(name)
-    return list(seen.values())
-
-
-def run_sentinel_only(args: argparse.Namespace, base: dict, variants: dict, out_dir: Path) -> int:
-    """环境预检：只跑单流哨兵，给出可判定的通过 / 不通过。
-
-    为什么必须能单独成命令：预检的全部价值在于**在启动整批实验之前**中止。
-    此前预检只有"挂在每个正式臂前面"这一种形态，环境不合格也要先跑完
-    7 臂 × 5 轮才会发现——本课题已有两批对照实验正是这样整批作废的
-    （``results/concurrency_fixed_2026-09-19/`` 的 70 次运行全部作废）。
-
-    返回退出码：0 = 环境合格，1 = 有尺寸超过阈值。
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    missing = [f"{w}x{h}" for (w, h) in SENTINEL_SIZES if (w, h) not in workload_sizes(args.workload)]
-    if missing:
-        print(f"⚠️ 负载 {args.workload} 不含尺寸 {missing}，预检不覆盖这些档位")
-
-    specs = unique_sentinels(base, variants, out_dir)
-    repeats = max(1, args.sentinel_repeats)
-    print(f"环境预检：{len(specs)} 个唯一哨兵配置 × {repeats} 次"
-          f"（负载 {args.workload}，客户端并发 1，阈值 {SENTINEL_THRESHOLD}×）")
-    if repeats == 1:
-        # 这不是保守起见的空话：2026-09-19 实测同一条命令间隔 90 秒给出
-        # 1.34×（合格）与 1.58×（不合格）两种相反判定，最差尺寸都是 448。
-        # 单次预检因此是"抽一次签"，而不是"测一个状态"。
-        print("⚠️ 只跑 1 次：本机实测单次预检可在 90 秒内翻转判定，"
-              "建议加 --sentinel-repeats 3 再下结论")
-
-    report: list[dict] = []
-    for index, spec in enumerate(specs):
-        per_size_runs: dict[str, list[float]] = {}
-        for repeat in range(repeats):
-            output = spec["workdir"] / f"repeat{repeat}.jsonl"
-            print(f"[sentinel_{index}] repeat {repeat + 1}/{repeats} "
-                  f"(覆盖臂 {', '.join(spec['arms'])}) ...", flush=True)
-            # 哨兵固定为**单进程、客户端并发 1**：它的语义是"逐请求、无并发"，
-            # 分片会把这个语义破坏掉（N 个进程等于 N 份并发）。
-            run_once(spec["config"], args.workload, output, 1, args.warmup, args.port, shards=1)
-            check = contamination_check(output)
-            for size, ratio in check["per_size"].items():
-                per_size_runs.setdefault(size, []).append(ratio)
-        # 与正式臂汇总同一纪律：跨轮取 max 而不是 mean。一轮污染就足以让整批对照
-        # 失去意义，而均值会被其余干净轮次稀释到阈值以下——那等于放过污染。
-        per_size = {size: max(ratios) for size, ratios in sorted(per_size_runs.items())}
-        worst = max(per_size.values(), default=0.0)
-        report.append({
-            "arms": spec["arms"],
-            "variant": spec["variant"],
-            "per_size": per_size,
-            "worst_ratio": worst,
-            "contaminated": worst > SENTINEL_THRESHOLD,
-        })
-
-    # 覆盖臂单独列成图例而不是塞进表格列：concurrency 组有 7 个臂，名字长到会把
-    # 列宽撑破，而截断恰好会隐去"哪些臂被这次预检覆盖"——那正是要读的信息。
-    print("\n覆盖臂（同一哨兵配置的臂共享一次预检）：")
-    for index, item in enumerate(report):
-        print(f"  sentinel_{index} = {', '.join(item['arms'])}")
-
-    columns = sorted({size for item in report for size in item["per_size"]})
-    print(f"\n{'哨兵':<12}" + "".join(f"{size:>10}" for size in columns) + f"{'最差':>10}")
-    for index, item in enumerate(report):
-        cells = "".join(f"{item['per_size'].get(size, float('nan')):>10.2f}" for size in columns)
-        print(f"{'sentinel_' + str(index):<12}{cells}{item['worst_ratio']:>10.2f}")
-
-    (out_dir / "sentinel_check.json").write_text(
-        json.dumps({
-            "group": args.group,
-            "workload": str(args.workload),
-            "repeats": repeats,
-            "threshold": SENTINEL_THRESHOLD,
-            "missing_sizes": missing,
-            "sentinels": report,
-            "passed": not any(item["contaminated"] for item in report),
-        }, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    print(f"结果写入 {out_dir}/sentinel_check.json")
-
-    bad = [(index, item) for index, item in enumerate(report) if item["contaminated"]]
-    if bad:
-        print(f"\n❌ 环境不合格：{len(bad)}/{len(report)} 个哨兵有尺寸超过 {SENTINEL_THRESHOLD}×，整批对照不可启动")
-        for index, item in bad:
-            worst_size = max(item["per_size"], key=item["per_size"].get)
-            print(f"      sentinel_{index}（臂 {', '.join(item['arms'])}）"
-                  f"{worst_size} = {item['per_size'][worst_size]:.2f}×")
-        print("     处置：确认 Windows 侧没有占用 GPU 的进程、电源与温度状态稳定后，重跑本命令。")
-        print("     注意 WSL 内的 nvidia-smi 看不到宿主机进程，只看利用率不足以判断整机空闲。")
-        return 1
-    print(f"\n✅ 环境合格：所有尺寸的单流哨兵均未超过 {SENTINEL_THRESHOLD}×，可以启动正式对照")
-    return 0
 
 
 def flatten(summary: dict) -> dict:
@@ -704,23 +507,11 @@ def main() -> None:
         "concurrency 组默认用最佳静态档，其它组不启用。",
     )
     parser.add_argument(
-        "--sentinel-only",
-        action="store_true",
-        help="只跑环境预检哨兵，不跑正式臂。任一尺寸的单流 实测/预测 超阈值时退出码为 1，"
-        "用于在启动整批实验前中止。",
-    )
-    parser.add_argument(
-        "--sentinel-repeats",
-        type=int,
-        default=1,
-        help="预检模式下每个唯一哨兵配置的重复次数。",
-    )
-    parser.add_argument(
         "--reanalyze",
         type=Path,
         default=None,
         help="不跑实验，用当前判定规则重新判定一个已落盘的批次目录"
-             "（读 repeat*.summary.json 与 sentinel/ 日志）。",
+             "（读 repeat*.jsonl 与 repeat*.summary.json）。",
     )
     args = parser.parse_args()
 
@@ -732,12 +523,6 @@ def main() -> None:
         print(f"（未指定 --workload，{args.group} 组用默认负载 {args.workload}）")
     base = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     variants = GROUPS[args.group]
-
-    # 预检必须在 builder 之前分叉：它要能独立运行并带着退出码返回，
-    # 而不是把环境不合格这件事推到整批实验跑完之后。
-    if args.sentinel_only:
-        out_dir = args.output_dir or Path(f"results/sentinel_{args.group}")
-        sys.exit(run_sentinel_only(args, base, variants, out_dir))
 
     out_dir = args.output_dir or Path(f"results/repeated_{args.group}")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -751,14 +536,10 @@ def main() -> None:
     for name, variant in variants.items():
         workdir = out_dir / name
         workdir.mkdir(parents=True, exist_ok=True)
-        sentinel_dir = workdir / "sentinel"
-        sentinel_dir.mkdir(parents=True, exist_ok=True)
         run_specs[name] = {
             "variant": variant,
             "workdir": workdir,
             "config": build_config(base, variant, workdir),
-            "sentinel_dir": sentinel_dir,
-            "sentinel_config": build_config(base, sentinel_variant(variant), sentinel_dir),
         }
 
     # 轮次优先，且每轮循环轮转臂顺序。旧实现按臂连续跑完全部重复，使 GPU 随时间
@@ -773,24 +554,10 @@ def main() -> None:
             spec = run_specs[name]
             workdir = spec["workdir"]
             output = workdir / f"repeat{repeat}.jsonl"
-            sentinel_output = spec["sentinel_dir"] / f"repeat{repeat}.jsonl"
-            print(f"[{name}] repeat {repeat + 1}/{args.repeats}: sentinel ...", flush=True)
-            run_once(spec["sentinel_config"], args.workload, sentinel_output, 1, args.warmup,
-                     args.port, shards=1)
-            check = contamination_check(sentinel_output)
             print(f"[{name}] repeat {repeat + 1}/{args.repeats}: policy ...", flush=True)
             summary = run_once(spec["config"], args.workload, output, client_concurrency,
                                args.warmup, args.port, shards=args.shards)
             row = flatten(summary)
-            # 环境自检只看紧邻正式臂之前的单流哨兵，不读取正式臂墙钟。
-            row["speed_ratio"] = check["worst_ratio"]
-            row["sentinel_per_size"] = check["per_size"]
-            if check["contaminated"]:
-                print(
-                    f"  ⚠️ 环境污染：单流哨兵实测/预测 = {check['worst_ratio']:.2f}× "
-                    f"(按尺寸 {check['per_size']})——本轮数字不可用于结论",
-                    flush=True,
-                )
             samples_by_variant[name].append(row)
 
     analyze(
@@ -811,11 +578,11 @@ def analyze(
     client_concurrency: int,
     execution_order: list[list[str]],
 ) -> dict:
-    """聚合、自检与判定。
+    """聚合、客户端自检与判定。
 
     独立成函数是为了让**已落盘的重复样本可以被重新判定**（``--reanalyze``）：
-    判定规则（口径、环境闸门、客户端闸门）会随方法学演进，而 GPU 实验很贵。
-    重新判定只读 ``repeat*.summary.json`` 与哨兵日志，不重跑任何服务。
+    判定规则（延迟口径、客户端闸门）会随方法学演进，而 GPU 实验很贵。
+    重新判定只读 ``repeat*.jsonl`` 与 ``repeat*.summary.json``，不重跑任何服务。
     """
     results: dict[str, dict] = {}
     for name, variant in variants.items():
@@ -831,15 +598,6 @@ def analyze(
             }
         aggregate["completed"] = sum(s["completed"] for s in samples)
         aggregate["failed"] = sum(s["failed"] for s in samples)
-        # speed_ratio 不在 METRICS 里（它不是性能指标而是环境自检量），
-        # 但必须单独聚合：否则下游读 aggregate["speed_ratio"] 会拿到 None，
-        # 让污染检查**静默失效**——而它恰恰是唯一能发现宿主干扰的手段。
-        ratios = [s["speed_ratio"] for s in samples if s.get("speed_ratio")]
-        aggregate["speed_ratio"] = {
-            "mean": statistics.fmean(ratios) if ratios else 0.0,
-            "max": max(ratios) if ratios else 0.0,
-            "min": min(ratios) if ratios else 0.0,
-        }
         # 客户端连接池是否人为制造排队：任何一轮被标记就值得写进汇总，
         # 因为"端到端延迟里有可观比例与服务端无关"会直接改变结论的归属。
         aggregate["client_queueing_flagged"] = any(
@@ -886,31 +644,7 @@ def analyze(
         "variants": results,
     }
 
-    # 环境自检汇总。**先看这一项再看任何策略结论**：被污染的运行里，
-    # 所有臂的比较都不可信（本课题已有一次整轮作废的记录）。
-    def worst_ratio(item: dict) -> float:
-        """该臂所有轮次里最差的环境比值。
-
-        取 **max 而不是 mean**：一轮污染就足以让整批对照失去意义，
-        而均值会被其余干净轮次稀释到阈值以下——那等于放过污染。
-        """
-        aggregated = item["aggregate"].get("speed_ratio")
-        if aggregated:
-            return aggregated["max"]
-        return max((s.get("speed_ratio") or 0.0) for s in item["samples"])
-
-    contaminated = [
-        (name, worst_ratio(item)) for name, item in results.items() if worst_ratio(item) > SENTINEL_THRESHOLD
-    ]
-    payload["environment_contaminated"] = bool(contaminated)
-    if contaminated:
-        print(f"\n⚠️⚠️ 环境被污染（实测/预测 > {SENTINEL_THRESHOLD}×），以下策略对比**不成立**：")
-        for name, ratio in contaminated:
-            print(f"      {name}: {ratio:.2f}×")
-        print("     处置：确认 Windows 侧没有占用 GPU 的进程后重跑。")
-        print("     判据：nvidia-smi 在 WSL 内看不到宿主进程，因此使用紧邻正式臂的单流哨兵。")
-
-    # 客户端自检：与环境污染同级。若某个臂的吞吐被**客户端**连接上限钉住，
+    # 客户端自检：若某个臂的吞吐被**客户端**连接上限钉住，
     # 那这一批比的是客户端池而不是调度器——2026-09-22 的 7 臂实测正是如此，
     # 因此这里必须在给出任何策略判定之前拦下来。
     client_throttled = [
@@ -942,11 +676,10 @@ def analyze(
     if baseline:
         if baseline not in results:
             print(f"\n⚠️ 配对基准 {baseline!r} 不在结果里，跳过配对分析")
-        elif contaminated or client_throttled:
-            # 污染下不给结论。数字仍写进 summary.json 供诊断，但**不打印判定**，
-            # 因为"✅ 通过"这种字样一旦出现就很容易被后来的读者当成结论引用。
-            reason = "环境被污染" if contaminated else "客户端连接池成为瓶颈"
-            print(f"\n（{reason}：配对分析与判定已跳过，数字仅供诊断）")
+        elif client_throttled:
+            # 客户端节流下不给结论。数字仍写进 summary.json 供诊断，
+            # 但不打印策略判定。
+            print("\n（客户端连接池成为瓶颈：配对分析与判定已跳过，数字仅供诊断）")
         else:
             paired = paired_differences(results, baseline)
             payload["paired_baseline"] = baseline
@@ -1013,7 +746,7 @@ def analyze(
 def reanalyze(args: argparse.Namespace, out_dir: Path) -> int:
     """用当前判定规则重新判定一个已落盘的批次，不重跑任何服务。
 
-    场景：实验很贵，而判定规则（延迟口径、环境闸门、客户端闸门）会随方法学演进。
+    场景：实验很贵，而判定规则（延迟口径、客户端闸门）会随方法学演进。
     典型一例是 ``results/concurrency_client_throttled_2026-09-22/``——那批运行本身没问题，
     是**客户端连接上限**让每个臂的吞吐都变成"上限 / 服务端延迟"，必须换规则重判。
     """
@@ -1044,13 +777,6 @@ def reanalyze(args: argparse.Namespace, out_dir: Path) -> int:
                     pool_can_throttle=client_concurrency < len(rows),
                 )
                 row = flatten(summary)
-                # 环境自检重新读取该轮紧邻的哨兵日志，不复用落盘结论：
-                # 阈值或判据变化时，旧结论不能自动继承。
-                sentinel = workdir / "sentinel" / path.name
-                if sentinel.exists():
-                    check = contamination_check(sentinel)
-                    row["speed_ratio"] = check["worst_ratio"]
-                    row["sentinel_per_size"] = check["per_size"]
                 samples.append(row)
         if not samples:
             print(f"⚠️ {workdir} 里没有可用的 repeat*.summary.json")

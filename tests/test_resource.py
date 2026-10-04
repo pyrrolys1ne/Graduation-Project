@@ -4,11 +4,21 @@ import pytest
 
 import encoder_sched.resource as resource_module
 from encoder_sched.resource import (
+    NoopResourceBackend,
     ProxyResourceBackend,
     ResourceApplyError,
     UnsupportedResourceBackend,
     create_resource_backend,
 )
+
+
+def test_none_backend_explicitly_reports_no_partition():
+    backend = create_resource_backend("none", "", False)
+    assert isinstance(backend, NoopResourceBackend)
+    result = backend.apply_quota(0, 1.0)
+    assert result["backend"] == "none"
+    assert result["enforced"] is False
+    assert backend.describe()["fallback_active"] is False
 
 
 def test_proxy_does_not_claim_enforcement():

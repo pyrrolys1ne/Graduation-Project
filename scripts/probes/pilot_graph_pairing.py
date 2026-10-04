@@ -49,9 +49,8 @@
 不是产生对照数据。§24.1 的配对矩阵来自**那一次干净运行**，这一点必须与数字一起引用。
 
 用法：
-    .venv-linux/bin/python scripts/probes/pilot_graph_pairing.py --duration 3
+    .venv/bin/python scripts/probes/pilot_graph_pairing.py --duration 3
 
-⚠️ 本脚本会独占 GPU（约 3–4 分钟含捕获），跑之前先确认宿主侧空闲。
 """
 
 from __future__ import annotations

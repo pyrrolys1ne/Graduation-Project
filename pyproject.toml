@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "encoder-sched"
 version = "0.1.0"
-description = "SLO-aware concurrent scheduling prototype for multimodal encoders"
-requires-python = ">=3.10,<3.13"
+description = "Concurrent inference prototype for small multimodal requests"
+requires-python = ">=3.10,<3.14"
 dependencies = [
   "fastapi>=0.115,<1",
   "httpx>=0.27,<1",
@@ -25,6 +25,10 @@ gpu = [
 ]
 test = ["pytest>=8,<9", "pytest-asyncio>=0.24,<2"]
 plot = ["matplotlib>=3.9,<4", "seaborn>=0.13,<1"]
+
+[project.scripts]
+encoder-sched-server = "encoder_sched.api:main"
+encoder-sched-check = "encoder_sched.runtime:main"
 
 [tool.setuptools.packages.find]
 include = ["encoder_sched*"]

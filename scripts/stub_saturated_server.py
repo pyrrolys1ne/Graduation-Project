@@ -28,8 +28,8 @@
 
 用法：
 
-    .venv-linux/bin/python scripts/stub_saturated_server.py --service-ms 4.5 --port 8099
-    .venv-linux/bin/python scripts/run_experiment.py \\
+    .venv/bin/python scripts/stub_saturated_server.py --service-ms 4.5 --port 8099
+    .venv/bin/python scripts/run_experiment.py \\
         --url http://127.0.0.1:8099 --workload data/workloads/saturating_280rps.jsonl \\
         --output /tmp/stub.jsonl --concurrency 900 --warmup 5
 

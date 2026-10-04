@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import concurrent.futures
+import argparse
 import json
 
 from encoder_sched.config import load_config
@@ -20,7 +21,10 @@ from encoder_sched.scheduler import Scheduler
 
 
 def main() -> None:
-    config = load_config()
+    parser = argparse.ArgumentParser(description="运行两个尺寸的 CLIP GPU 并发 smoke test")
+    parser.add_argument("--config", default="config.yaml")
+    args = parser.parse_args()
+    config = load_config(args.config)
     resource = create_resource_backend(
         config.executor.resource_backend,
         config.executor.libsmctrl_adapter,
