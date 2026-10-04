@@ -1132,7 +1132,8 @@ proxy 后端、客户端并发 8，7 臂 × 5 次；每个正式样本前有一�
 
 **Git**：远程 `git@github.com:pyrrolys1ne/Graduation-Project.git`（**public**），首次提交 `2baeaff`（39 文件）。SSH 复用 Windows 侧 `id_ed25519`（9p 挂载下权限恒为 777，SSH 会拒绝，必须先复制到 Linux 文件系统再 chmod 600）。
 
-**⚠️ 隐私线**：该仓库是 public，而 `.gitignore` 曾在本会话期间被改动、丢掉三条刻意排除的规则，导致 `AGENTS.md`、`inspect_zotero.py`、`.agents/`（含中科大开题答辩时间、导师意见、本机路径）一度进入待提交清单。已重新排除并补充 `*.egg-info/`、`.claude/`。**今后若 `.gitignore` 再次变动，须核对这三条规则仍在。**
+**⚠️ 公开范围（2026-10-04 更新）**：该仓库是 public。用户决定公开研究文档，已把 `docs/`、`AGENTS.md`、`任务书.txt`、`.agents/`、`data/workloads/` 纳入版本控制并推送（提交 `388ec5a`）。**此前"这三条必须排除"的规则作废**——不要再按它判断。推送前已脱敏公开材料中的本机 Windows 用户名（`docs/实验记录.md`、本文件），保留为 `C:\Users\<user>\...`；探针里的 `/home/lyon/...` 本机路径未改（功能性 `sys.path`，且已在历史中）。
+**仍排除**：`results/`（722 MB，含 93 MB 单文件 `results/requests.jsonl`）与 `literature/`（31 篇论文全文，版权）——两者留在本地，未进公开仓库；`inspect_zotero.py` 与 `.claude/` 亦仍排除。**今后若 `.gitignore` 再次变动，须核对 `results/`、`literature/` 仍在排除项内。**
 
 **运行环境陷阱**：WSL2 与 Windows 共享同一块 GPU，**宿主机进程不出现在 WSL 的 `nvidia-smi` 计算进程列表里**，但会显著拖慢执行。跑实验前必须确认 GPU 利用率接近 0%（本课题已有一次因宿主机运行游戏而整轮作废）。
 
